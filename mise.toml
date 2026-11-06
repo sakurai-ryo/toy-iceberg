@@ -6,6 +6,10 @@ run = "docker compose up -d --wait rustfs && docker compose run --rm create-buck
 description = "RustFS を停止する。データのボリュームは残す"
 run = "docker compose down"
 
+[tasks.reset]
+description = "RustFS を停止してデータのボリュームを削除する。再開は mise run up"
+run = "docker compose down -v"
+
 [tasks.test]
 description = "全テストを実行する。先に mise run up が必要"
 run = "cargo test"
