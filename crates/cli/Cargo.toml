@@ -1,0 +1,14 @@
+[package]
+name = "toy-iceberg-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "toy-iceberg"
+path = "src/main.rs"
+
+[dependencies]
+toy-iceberg-core.workspace = true
+toy-iceberg-datafusion.workspace = true
+tokio.workspace = true

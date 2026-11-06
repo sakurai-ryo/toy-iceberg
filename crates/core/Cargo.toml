@@ -1,0 +1,20 @@
+[package]
+name = "toy-iceberg-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+apache-avro.workspace = true
+arrow.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+object_store.workspace = true
+parquet.workspace = true
+percent-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true

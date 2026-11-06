@@ -1,0 +1,24 @@
+[tasks.up]
+description = "RustFS を起動して warehouse バケットを作成する"
+run = "docker compose up -d --wait rustfs && docker compose run --rm create-bucket"
+
+[tasks.down]
+description = "RustFS を停止する。データのボリュームは残す"
+run = "docker compose down"
+
+[tasks.test]
+description = "全テストを実行する。先に mise run up が必要"
+run = "cargo test"
+
+[tasks.check]
+description = "cargo fmt と cargo clippy を実行する"
+run = ["cargo fmt", "cargo clippy --all-targets"]
+
+[tasks.fix]
+description = "cargo fmt と cargo clippy --fix で自動修正する"
+run = ["cargo fmt", "cargo clippy --all-targets --fix --allow-dirty"]
+
+[tasks.sql]
+description = "SQL を1文実行する"
+usage = 'arg "<sql>"'
+run = 'cargo run -q -p toy-iceberg-cli -- "${usage_sql?}"'
