@@ -28,6 +28,8 @@ mise run test
 
 接続先は `TOY_ICEBERG_ENDPOINT`、`TOY_ICEBERG_BUCKET`、`TOY_ICEBERG_REGION`、`TOY_ICEBERG_ACCESS_KEY`、`TOY_ICEBERG_SECRET_KEY` で変更できます。既定値は `compose.yaml` の RustFS を指します。
 
+`mise run up` の後は、RustFS の管理画面 <http://localhost:9001/rustfs/console/> でバケットの中身を確認できます。ログインにはアクセスキーとシークレットキーのどちらも `rustfsadmin` を使います。
+
 スナップショットと内部構造は、テーブル名に接尾辞を付けて参照します。識別子はダブルクォートで囲みます。
 
 ```sql
