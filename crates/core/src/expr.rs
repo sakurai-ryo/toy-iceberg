@@ -42,8 +42,8 @@ pub enum Predicate {
 /// ある行が `pred` を満たすなら、その行のパーティションタプルは変換後の述語を満たす。
 /// 逆は成り立たなくてよい。たとえば `ts > X` は `day(ts) >= day(X)` になる。
 ///
-/// float は `True` に変換する。エンジンは NaN をどの数より大きいものとして扱うが、
-/// 上下限は NaN を含まないので、範囲の比較でエンジンが残す行を除外するおそれがある。
+/// float の比較は `True` に変換する。エンジンは正の NaN をどの数より大きく、負の NaN をどの数より
+/// 小さく扱うが、上下限は NaN を含まないので、範囲の比較でエンジンが残す行を除外するおそれがある。
 pub fn project(pred: &Predicate, spec: &PartitionSpec, schema: &Schema) -> Predicate {
     let per_field = |id: i32, f: &dyn Fn(usize, Transform) -> Predicate| -> Predicate {
         let terms: Vec<_> = spec

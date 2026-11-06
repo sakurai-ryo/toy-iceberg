@@ -144,9 +144,8 @@ fn avro_type(ty: Type) -> Json {
     }
 }
 
-/// `apache_avro` の `Schema::parse` は配列のカスタム属性を捨てるので、解析後に復元する。
-/// 読み手はこの属性を必要とする。仕様は int キーの map に `logicalType: map` を要求し、
-/// リストの要素は `element-id` で field id を持つからである。
+/// `apache_avro` の `Schema::parse` は配列の `logicalType` を捨てるので、解析後に復元する。
+/// 仕様が int キーの map に `logicalType: map` を要求しており、読み手はこの属性を必要とする。
 fn parse_schema(json: &Json) -> Result<AvroSchema> {
     let mut schema = AvroSchema::parse(json)?;
     restore_array_attributes(&mut schema)?;
