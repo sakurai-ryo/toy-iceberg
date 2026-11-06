@@ -1,3 +1,5 @@
+//! SQL を1文実行するコマンド。プロセスは状態を持たず、毎回 Catalog からテーブルを読み直す。
+
 use std::process::ExitCode;
 
 use toy_iceberg_core::catalog::{Catalog, S3Config};

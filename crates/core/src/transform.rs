@@ -1,3 +1,10 @@
+//! パーティション transform。仕様の「Partition Transforms」を実装する。
+//!
+//! transform は列の値からパーティション値を計算する関数である。Iceberg はこの定義を
+//! metadata に持つので、利用者はパーティション用の列を自分で管理しなくてよい（隠しパーティション）。
+//! すべての実装が同じ値を計算する必要がある。値が異なると、別の実装が書いたファイルを
+//! pruning で誤って除外してしまう。
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -11,6 +18,9 @@ use crate::values::{Datum, UNIX_EPOCH_DAYS_FROM_CE};
 const MICROS_PER_HOUR: i64 = 3_600_000_000;
 const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
 
+/// JSON では `bucket[16]` のような文字列で表す（「Appendix C」の Partition Specs）。
+///
+/// `Void` は常に null を返す transform で、他の実装が作ったテーブルを読むために対応している。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum Transform {
@@ -85,6 +95,8 @@ impl From<Transform> for String {
 }
 
 impl Transform {
+    /// transform の適用可否と結果の型。仕様の「Partition Transforms」の表に対応する。
+    /// manifest の `partition` は結果の型で保存されるので、読み書きの両方でこの型を使う。
     pub fn result_type(&self, source: Type) -> Result<Type> {
         use Type::*;
         let timestamp = matches!(source, Timestamp | Timestamptz);
@@ -105,6 +117,9 @@ impl Transform {
         })
     }
 
+    /// 値に transform を適用する。`year`、`month`、`hour` は 1970 年を起点にした整数を返す。
+    /// `Bucket` の `& i32::MAX` は、負のハッシュ値でも結果が非負になるよう仕様が定めた計算である。
+    /// 日時の除算に `div_euclid` を使うのは、1970 年より前の値も切り捨ての向きをそろえるためである。
     pub fn apply(&self, v: &Datum) -> Result<Option<Datum>> {
         self.result_type(v.ty())?;
         Ok(match self {
@@ -146,10 +161,12 @@ fn date_of(v: &Datum) -> Result<NaiveDate> {
         .ok_or_else(|| Error::Invalid(format!("date out of range: {days}")))
 }
 
+/// 仕様の「Truncate Transform Details」。整数は負の値でも小さい側へ丸める（`rem_euclid`）。
+/// 文字列はバイトではなく Unicode のコードポイント単位で切る。
 fn truncate(v: &Datum, w: u32) -> Datum {
     match v {
-        // Near the type's minimum the exact result is unrepresentable. Saturating keeps the
-        // transform monotonic, which inclusive projection relies on.
+        // 型の最小値の近くでは正確な結果を表現できない。飽和させれば transform の単調性を保てる。
+        // inclusive projection はこの単調性を前提にしている。
         Datum::Int(x) => Datum::Int(x.saturating_sub(x.rem_euclid(w as i32))),
         Datum::Long(x) => Datum::Long(x.saturating_sub(x.rem_euclid(w as i64))),
         Datum::String(s) => Datum::String(s.chars().take(w as usize).collect()),
@@ -158,8 +175,8 @@ fn truncate(v: &Datum, w: u32) -> Datum {
     }
 }
 
-/// The 32-bit hash from spec Appendix B. `int` hashes as `long` so that a column
-/// promoted from int to long keeps its bucket.
+/// 仕様の「Appendix B: 32-bit Hash Requirements」のハッシュ。`bucket` transform が使う。
+/// `int` を `long` としてハッシュするのは、int から long へ昇格した列でも同じ bucket を保つためである。
 pub fn hash(v: &Datum) -> i32 {
     let long = |x: i64| murmur3_32(&x.to_le_bytes());
     match v {
@@ -173,6 +190,7 @@ pub fn hash(v: &Datum) -> i32 {
     }
 }
 
+/// 仕様が指定する Murmur3 の x86 32 ビット版（シードは 0）。
 fn murmur3_32(data: &[u8]) -> i32 {
     const C1: u32 = 0xcc9e_2d51;
     const C2: u32 = 0x1b87_3593;

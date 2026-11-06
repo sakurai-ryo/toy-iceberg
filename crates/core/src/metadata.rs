@@ -1,3 +1,9 @@
+//! metadata ファイル。仕様の「Table Metadata」「Snapshots」と「Appendix C」の JSON 表現を実装する。
+//!
+//! metadata ファイルは、ある時点のテーブルの全状態（スキーマ、パーティション定義、
+//! 全 snapshot の一覧）を持つ JSON である。コミットのたびに新しいファイルを丸ごと書き、
+//! 古いファイルは変更しない。
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -7,22 +13,31 @@ use crate::error::{Result, invalid};
 use crate::partition::PartitionSpec;
 use crate::types::Schema;
 
+// 仕様の「Table Metadata」は、`main` ブランチの ref が常に `current-snapshot-id` を指すことを求める。
 pub const MAIN_BRANCH: &str = "main";
 
+/// ある時点のテーブルの内容。仕様の「Snapshots」にあたる。
+///
+/// 内容の実体は `manifest_list` が指す manifest list にある。snapshot を metadata に
+/// 残しておくだけで、過去の状態を読める（タイムトラベル）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Snapshot {
     pub snapshot_id: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_snapshot_id: Option<i64>,
-    /// Snapshots written before an upgrade from v1 have no sequence number; the spec reads 0.
+    /// コミットの順序を表す番号。仕様の「Sequence Numbers」にあたり、コミットごとに1増える。
+    /// v1 からアップグレードする前に書かれた snapshot には番号がなく、仕様は 0 として読むと定めている。
     #[serde(default)]
     pub sequence_number: i64,
     pub timestamp_ms: i64,
     pub manifest_list: String,
+    /// `operation` と各種の件数。仕様の「Snapshots」は `operation` を必須としている。
     pub summary: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_id: Option<i32>,
+    /// v3 の row lineage。この snapshot が割り当てた row id の範囲の始点と個数を表す。
+    /// 仕様の「Snapshot Row IDs」にあたる。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_row_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,6 +46,7 @@ pub struct Snapshot {
     pub extra: BTreeMap<String, Value>,
 }
 
+/// `current-snapshot-id` の変更履歴の1行。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SnapshotLogEntry {
@@ -38,6 +54,7 @@ pub struct SnapshotLogEntry {
     pub timestamp_ms: i64,
 }
 
+/// 過去の metadata ファイルの履歴の1行。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct MetadataLogEntry {
@@ -45,21 +62,26 @@ pub struct MetadataLogEntry {
     pub timestamp_ms: i64,
 }
 
-/// Table metadata file contents. Sort orders, refs and any field this implementation does not
-/// model stay as JSON so that a commit does not drop what another writer stored.
+/// metadata ファイルの内容。
+///
+/// sort order、ref、この実装が扱わないフィールドは JSON のまま保持する。型にしないフィールドを
+/// 捨てると、コミットのたびに他の書き手が保存した情報を消してしまうためである。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct TableMetadata {
     pub format_version: i32,
     pub table_uuid: String,
     pub location: String,
+    /// 次のコミットはこの値に1を足した番号を使う。
     pub last_sequence_number: i64,
     pub last_updated_ms: i64,
+    /// これまでに割り当てた field id の最大値。削除した列の ID を再利用しないために持つ。
     pub last_column_id: i32,
     pub schemas: Vec<Schema>,
     pub current_schema_id: i32,
     pub partition_specs: Vec<PartitionSpec>,
     pub default_spec_id: i32,
+    /// これまでに割り当てたパーティションフィールド ID の最大値。
     pub last_partition_id: i32,
     #[serde(default)]
     pub properties: BTreeMap<String, String>,
@@ -75,6 +97,7 @@ pub struct TableMetadata {
     pub default_sort_order_id: i32,
     #[serde(default)]
     pub refs: BTreeMap<String, Value>,
+    /// v3 の row lineage で次に割り当てる row id。v3 では必須で、v2 では `None` になる。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_row_id: Option<i64>,
     #[serde(flatten)]
@@ -119,7 +142,8 @@ impl TableMetadata {
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let mut metadata: TableMetadata = serde_json::from_slice(bytes)?;
-        // Older Java writers use -1 for "no current snapshot".
+        // 古い Java 実装は「現在の snapshot なし」を -1 で書く。仕様の「Appendix F」が互換のために
+        // `null` と同じ扱いを認めている。
         if metadata.current_snapshot_id == Some(-1) {
             metadata.current_snapshot_id = None;
         }
@@ -127,6 +151,10 @@ impl TableMetadata {
         Ok(metadata)
     }
 
+    /// 読み込みの時点で不整合な metadata を拒否する。ここで検査するので、
+    /// [`Self::current_schema`] などは参照先の存在を前提にできる。
+    ///
+    /// この実装が対応するのは v2 と v3 で、v1 は拒否する。
     fn validate(&self) -> Result<()> {
         if !(2..=3).contains(&self.format_version) {
             return invalid(format!(
@@ -196,6 +224,8 @@ impl TableMetadata {
         self.current_snapshot_id.and_then(|id| self.snapshot(id))
     }
 
+    /// snapshot を現在の状態として追加する。`refs` の `main` は既存のエントリの `snapshot-id` だけを
+    /// 更新する。エントリごと作り直すと、他の書き手が保存した保持期間の設定などが失われる。
     pub(crate) fn add_snapshot(&mut self, snapshot: Snapshot) {
         self.last_sequence_number = snapshot.sequence_number;
         self.last_updated_ms = snapshot.timestamp_ms;

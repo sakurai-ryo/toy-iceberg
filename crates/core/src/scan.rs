@@ -1,3 +1,8 @@
+//! 読み取り。仕様の「Scan Planning」を実装する。
+//!
+//! 処理は2段階に分かれる。[`TableScan::plan`] が metadata だけを読んで対象の data file を決め、
+//! [`read_task`] が各ファイルの Parquet を読む。
+
 use std::collections::HashMap;
 
 use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
@@ -20,17 +25,20 @@ use crate::transform::Transform;
 use crate::types::Field;
 use crate::values::Datum;
 
+/// 読む data file の1個。パーティション値を解釈するので、書いたときの定義の ID も持つ。
 #[derive(Debug, Clone)]
 pub struct FileScanTask {
     pub data_file: DataFile,
     pub spec_id: i32,
 }
 
+/// 読むファイルの一覧と、pruning の結果の件数。件数は `EXPLAIN` の表示に使う。
 #[derive(Debug, Clone, Default)]
 pub struct ScanPlan {
     pub tasks: Vec<FileScanTask>,
     pub manifests_total: usize,
     pub manifests_pruned: usize,
+    /// pruning を通過した manifest に含まれるファイルの数。テーブル全体のファイル数ではない。
     pub files_total: usize,
     pub files_pruned_by_partition: usize,
     pub files_pruned_by_metrics: usize,
@@ -61,6 +69,14 @@ impl<'a> TableScan<'a> {
         self
     }
 
+    /// 読む data file を決める。除外の判定は [`crate::expr`] の3段階で行う。
+    ///
+    /// 1. manifest list の要約で manifest を除外する。
+    /// 2. manifest を読み、パーティション値でファイルを除外する。
+    /// 3. 列統計でファイルを除外する。
+    ///
+    /// 上の階層の要約で除外できれば、下の階層を読まずに済む。どの段階も
+    /// 「一致する行を含みうるファイル」は残す。残りの絞り込みは呼び出し側が行う。
     pub async fn plan(&self) -> Result<ScanPlan> {
         let metadata = self.table.metadata();
         let snapshot = match self.snapshot_id {
@@ -82,10 +98,12 @@ impl<'a> TableScan<'a> {
 
         let mut selected: Vec<(&ManifestFile, Predicate)> = Vec::new();
         for m in &manifests {
-            // Skipping delete files would silently return deleted rows.
+            // delete file を読み飛ばすと、削除された行を黙って返してしまう。
             if m.content != CONTENT_DATA {
                 return Err(Error::Unsupported("tables with delete files".into()));
             }
+            // 仕様の「Scan Planning」は、現在の定義ではなく manifest を書いたときの定義で
+            // 述語を変換することを求める。パーティション進化があると manifest ごとに定義が異なるからである。
             let spec = spec_of(self.table, m.partition_spec_id)?;
             let projected = project(&self.filter, spec, schema);
             if manifest_may_match(&projected, &m.partitions, &spec.partition_type(schema)?) {
@@ -96,6 +114,7 @@ impl<'a> TableScan<'a> {
         }
 
         let entries = try_join_all(selected.iter().map(|(m, _)| self.table.entries(m))).await?;
+        // 仕様の「Scan Planning」のとおり、`DELETED` の entry はスキャンに使わない。
         for ((manifest, projected), entries) in selected.iter().zip(entries) {
             for entry in entries.into_iter().filter(|e| e.status != STATUS_DELETED) {
                 plan.files_total += 1;
@@ -122,7 +141,11 @@ fn spec_of(table: &Table, id: i32) -> Result<&PartitionSpec> {
         .ok_or_else(|| Error::Invalid(format!("partition spec {id} not found")))
 }
 
-// The replacement is a hand-written AsyncFileReader; this keeps the column-range reads for free.
+/// 1つの data file を読み、`projection` の列のバッチを返す。
+///
+/// 列は名前ではなく field id で探す。列名の変更があっても、ファイル内の古い名前に影響されず
+/// 正しい列を読める。これが Iceberg のスキーマ進化の前提である（仕様の「Schema Evolution」）。
+// 代替は `AsyncFileReader` の手書きになる。これを使えば、列の範囲だけを読む処理を書かずに済む。
 #[allow(deprecated)]
 pub async fn read_task(
     table: &Table,
@@ -153,6 +176,8 @@ pub async fn read_task(
             ))
         })
         .collect();
+    // field id のないファイルは仕様の name mapping が必要になる。対応しないのでエラーにする。
+    // そのまま進むと、全列が null の行を返してしまう。
     if file_columns.is_empty() && !builder.schema().fields().is_empty() {
         return Err(Error::Unsupported(format!(
             "{} has no field ids",
@@ -160,6 +185,8 @@ pub async fn read_task(
         )));
     }
 
+    // Parquet のリーダーは指定の順序によらずファイルの列順で返す。
+    // 下の `sources` が結果の位置を探せるよう、ソートしておく。
     let mut roots: Vec<usize> = projection
         .iter()
         .filter_map(|f| file_columns.get(&f.id).copied())
@@ -184,12 +211,14 @@ pub async fn read_task(
         .boxed())
 }
 
+/// 出力の1列の取得元。`Column` はファイルから読んだバッチの列の位置を指す。
 enum Source {
     Column(usize),
     Constant(Option<Datum>),
 }
 
-/// Spec: a field missing from a data file takes its identity partition value, else null.
+/// data file にない列の値を求める。仕様の「Schema Evolution」の規則のうち、identity パーティションの
+/// 値を使う規則と、それ以外を null にする規則を実装する。name mapping と `initial-default` には対応しない。
 fn identity_value(spec: &PartitionSpec, file: &DataFile, field_id: i32) -> Option<Datum> {
     let pos = spec
         .fields
@@ -198,6 +227,8 @@ fn identity_value(spec: &PartitionSpec, file: &DataFile, field_id: i32) -> Optio
     file.partition.get(pos)?.clone()
 }
 
+/// ファイルから読んだバッチを `projection` の形にする。`cast` は、ファイルの型とテーブルの型の
+/// 差を埋める。行数を明示するのは、`COUNT(*)` のように列が1つもないバッチでも行数を保つためである。
 fn shape_batch(
     batch: &RecordBatch,
     sources: &[Source],

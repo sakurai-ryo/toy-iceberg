@@ -1,3 +1,9 @@
+//! data file の書き込み。
+//!
+//! Iceberg の書き手には、Parquet を書くだけでなく、読み手の pruning に必要な情報を
+//! 用意する責任がある。ここでは行をパーティションごとに分け、ファイルごとに
+//! パーティション値と列統計を [`DataFile`] に記録する。
+
 use std::collections::BTreeMap;
 
 use arrow::array::{RecordBatch, UInt32Array};
@@ -18,8 +24,8 @@ use crate::values::Datum;
 
 const MAX_PARTITION_DIR_CHARS: usize = 128;
 
-// ponytail: buffers the whole append in memory; stream with a rolling writer per partition if
-// inserts outgrow RAM.
+// ponytail: 追記全体をメモリに載せる。INSERT がメモリに収まらなくなったら、
+// パーティションごとのローリングライターでストリーム処理にする。
 pub(crate) async fn write_data_files(
     table: &Table,
     batches: &[RecordBatch],
@@ -44,8 +50,8 @@ pub(crate) async fn write_data_files(
     try_join_all(writes).await
 }
 
-/// Matches columns by name. A failed cast is an error, because the default of writing null
-/// would lose the value without anyone noticing.
+/// 列を名前で対応づける。キャストの失敗はエラーにする。既定の動作では null を書くので、
+/// 値が誰にも気付かれず失われるためである。
 fn conform(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
         return invalid(format!(
@@ -72,6 +78,11 @@ fn conform(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
 type Partition = Vec<Option<Datum>>;
 type PartitionGroups = BTreeMap<Vec<u8>, (Partition, Vec<u32>)>;
 
+/// 行をパーティションタプルごとに分ける。仕様の「Partitioning」は、1つの data file の行が
+/// 同じパーティション値を持つことを要求する。
+///
+/// グループのキーには、null の目印と長さを付けたバイト列を使う。異なるタプルが
+/// 同じキーにならないようにするためである。
 fn group_by_partition(
     batch: &RecordBatch,
     schema: &Schema,
@@ -117,6 +128,9 @@ fn group_by_partition(
     Ok(groups)
 }
 
+/// 1つのパーティションの行を Parquet に書き、[`DataFile`] を返す。
+///
+/// `first_row_id` は `None` にする。row id はコミット時に確定するからである。
 async fn write_file(
     table: &Table,
     schema: &Schema,
@@ -161,8 +175,9 @@ async fn write_file(
     Ok(file)
 }
 
-/// Directory names are cosmetic since readers go through manifests, so anything outside a
-/// safe set is replaced instead of escaped, and long values are cut to fit key length limits.
+/// 読み手は manifest 経由でファイルを見つけるので、ディレクトリ名は読みやすさのためだけにある。
+/// Hive 形式と異なりパスを解析しないので、安全な文字以外は、エスケープせず置き換えても問題ない。
+/// 長い値はキーの長さ制限に収まるように切る。
 fn partition_dir(spec: &PartitionSpec, partition: &[Option<Datum>]) -> String {
     spec.fields
         .iter()
@@ -185,7 +200,9 @@ fn partition_dir(spec: &PartitionSpec, partition: &[Option<Datum>]) -> String {
         .collect()
 }
 
-// ponytail: walks every value as a Datum; read Parquet column statistics if writes get slow.
+// 列統計を計算する。仕様の「Manifest Entry Fields」に従い、上下限には null と NaN を含めない。
+//
+// ponytail: 全値を Datum にして走査する。書き込みが遅くなったら Parquet の列統計を読む。
 fn collect_metrics(file: &mut DataFile, field: &Field, batch: &RecordBatch, column: usize) {
     let (mut nulls, mut nans) = (0, 0);
     let mut bounds: Option<(Datum, Datum)> = None;

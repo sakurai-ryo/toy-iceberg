@@ -1,3 +1,8 @@
+//! DataFusion の `TableProvider` と実行プランの実装。
+//!
+//! `SELECT` は [`IcebergTable::scan`] から `TableScan::plan` と `read_task` に、
+//! `INSERT` は [`IcebergSink`] から `Table::append` に至る。
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -29,6 +34,7 @@ use toy_iceberg_core::types::Field;
 use crate::filter::to_predicate;
 use crate::to_df;
 
+/// `CREATE EXTERNAL TABLE ... STORED AS ICEBERG` の処理。
 #[derive(Debug)]
 pub struct IcebergTableFactory {
     catalog: Arc<Catalog>,
@@ -42,8 +48,8 @@ impl IcebergTableFactory {
 
 #[async_trait]
 impl TableProviderFactory for IcebergTableFactory {
-    /// Recognised options are `partitioning` and `format-version`; the others become table
-    /// properties. An empty `LOCATION` selects the default location.
+    /// 解釈するオプションは `partitioning` と `format-version` で、それ以外はテーブルのプロパティになる。
+    /// 空の `LOCATION` は既定の場所を選ぶ。
     async fn create(
         &self,
         state: &dyn Session,
@@ -63,13 +69,14 @@ impl TableProviderFactory for IcebergTableFactory {
             ));
         }
         let table_name = cmd.name.table();
+        // `$` と `@` はメタデータテーブルとタイムトラベルの名前解決に使うので、テーブル名に許可しない。
         if table_name.contains(['$', '@']) {
             return Err(DataFusionError::Plan(format!(
                 "{table_name:?} contains a character reserved for metadata tables and time travel"
             )));
         }
         let schema = schema_from_arrow(cmd.schema.as_arrow()).map_err(to_df)?;
-        // DataFusion prefixes option keys that contain no dot with `format.`.
+        // DataFusion は、ドットを含まないオプションのキーに `format.` を付ける。
         let mut properties: BTreeMap<_, _> = cmd
             .options
             .iter()
@@ -101,6 +108,7 @@ impl TableProviderFactory for IcebergTableFactory {
     }
 }
 
+/// `snapshot_id` が `None` なら最新の snapshot を、`Some` ならその snapshot を読む。
 #[derive(Debug, Clone)]
 pub(crate) struct IcebergTable {
     table: Table,
@@ -143,7 +151,7 @@ impl TableProvider for IcebergTable {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // A prepared statement keeps this provider, so the state at planning time can be stale.
+        // プリペアドステートメントはこのプロバイダを保持し続けるので、プラン作成時の状態は古い場合がある。
         let table = match self.snapshot_id {
             Some(_) => self.table.clone(),
             None => self.table.latest().await.map_err(to_df)?,
@@ -167,6 +175,8 @@ impl TableProvider for IcebergTable {
         )))
     }
 
+    /// `Inexact` は「押し下げたフィルタで絞るが、残った行の再評価は必要」という意味である。
+    /// Iceberg の pruning はファイル単位で、関係のない行も残るのでこの値を返す。
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -174,6 +184,8 @@ impl TableProvider for IcebergTable {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
+    /// この実装は追記だけに対応する。`table` が古くても `Table::append` が最新の状態の上に
+    /// コミットするので、ここで読み直す必要はない。
     async fn insert_into(
         &self,
         _state: &dyn Session,
@@ -193,6 +205,7 @@ impl TableProvider for IcebergTable {
     }
 }
 
+/// `FileScanTask` の一覧を読む実行プラン。DataFusion の並列度に合わせて、タスクをグループに分ける。
 #[derive(Debug, Clone)]
 struct IcebergScanExec {
     table: Arc<Table>,
@@ -292,6 +305,7 @@ impl ExecutionPlan for IcebergScanExec {
     }
 }
 
+/// `INSERT` の書き込み先。
 #[derive(Debug)]
 struct IcebergSink {
     table: Table,
@@ -315,6 +329,8 @@ impl DataSink for IcebergSink {
         data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
+        // 全バッチを集めて1回でコミットする。Iceberg の snapshot がコミットの単位なので、
+        // 1つの INSERT の行が途中まで見える状態を作らない。
         let batches: Vec<_> = data.try_collect().await?;
         let rows = batches.iter().map(|b| b.num_rows() as u64).sum();
         self.table.append(&batches).await.map_err(to_df)?;

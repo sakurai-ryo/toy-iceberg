@@ -1,3 +1,9 @@
+//! pruning に使う述語の変換と評価。仕様の「Scan Planning」を実装する。
+//!
+//! ここのすべての判定は「一致する行を含みうるか」を答える。答えが偽のものだけを除外し、
+//! 判定できないときは真を返す。関係のないファイルが残っても呼び出し側のフィルタで落ちるが、
+//! 一致する行を含むファイルを除外すると結果が欠ける。
+
 use std::cmp::Ordering;
 
 use crate::manifest::{DataFile, FieldSummary};
@@ -16,8 +22,11 @@ pub enum Op {
     GtEq,
 }
 
-/// A filter in negation normal form. The `i32` is a schema field id, except in the output of
-/// [`project`], where it is a position in the partition tuple.
+/// 否定標準形のフィルタ。`i32` はスキーマの field id である。ただし [`project`] の出力では
+/// パーティションタプル内の位置を指す。
+///
+/// `Not` を持たないのは、「含みうる」の判定は否定できないからである。`p` が「含みうる」と
+/// 判定されても、`NOT p` が「含まない」とは言えない。否定は変換の時点で内側へ押し込んでおく。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
     True,
@@ -29,9 +38,12 @@ pub enum Predicate {
     NotNull(i32),
 }
 
-/// Inclusive projection (spec "Scan Planning"): if a row matches `pred`, the row's partition
-/// tuple matches the result. Floats project to `True` because engines order NaN above every
-/// number, while bounds exclude NaN, so range checks could drop rows the engine would keep.
+/// inclusive projection（仕様の「Scan Planning」）。行の述語をパーティションの述語に変換する。
+/// ある行が `pred` を満たすなら、その行のパーティションタプルは変換後の述語を満たす。
+/// 逆は成り立たなくてよい。たとえば `ts > X` は `day(ts) >= day(X)` になる。
+///
+/// float は `True` に変換する。エンジンは NaN をどの数より大きいものとして扱うが、
+/// 上下限は NaN を含まないので、範囲の比較でエンジンが残す行を除外するおそれがある。
 pub fn project(pred: &Predicate, spec: &PartitionSpec, schema: &Schema) -> Predicate {
     let per_field = |id: i32, f: &dyn Fn(usize, Transform) -> Predicate| -> Predicate {
         let terms: Vec<_> = spec
@@ -75,8 +87,8 @@ pub fn project(pred: &Predicate, spec: &PartitionSpec, schema: &Schema) -> Predi
 }
 
 fn project_cmp(pos: usize, t: Transform, op: Op, v: &Datum) -> Predicate {
-    // Discrete types have a neighbour, so `x < v` is `x <= v - 1`. Transforming the neighbour
-    // is tighter: `day(x) <= day(v)` would keep a whole extra day when v is at midnight.
+    // 離散的な型には隣の値があるので、`x < v` は `x <= v - 1` と書ける。隣の値を変換すると除外が増える。
+    // v が 0 時ちょうどのとき、`day(x) <= day(v)` では丸1日分余計に残る。
     let tightened = match (t, op) {
         (Transform::Identity, _) => None,
         (_, Op::Lt) => successor(v, -1).map(|v| (Op::LtEq, v)),
@@ -91,13 +103,16 @@ fn project_cmp(pos: usize, t: Transform, op: Op, v: &Datum) -> Predicate {
     match (t, op) {
         (Transform::Identity, _) => Predicate::Cmp(pos, op, tv),
         (_, Op::Eq) => Predicate::Cmp(pos, Op::Eq, tv),
+        // `x != v` でも、同じパーティションに別の値の行がありうるので除外できない。
+        // `bucket` はハッシュなので大小関係を保たず、範囲比較に使えない。
         (_, Op::NotEq) | (Transform::Bucket(_) | Transform::Void, _) => Predicate::True,
-        // The remaining transforms are monotonic but lossy: strict bounds must relax.
+        // 残りの transform は単調だが情報を落とす。別の値が同じ結果になるので、厳密な不等号は緩める。
         (_, Op::Lt | Op::LtEq) => Predicate::Cmp(pos, Op::LtEq, tv),
         (_, Op::Gt | Op::GtEq) => Predicate::Cmp(pos, Op::GtEq, tv),
     }
 }
 
+/// 隣の値を返す。隣を持たない型や、オーバーフローする場合は `None` を返す。
 fn successor(v: &Datum, delta: i32) -> Option<Datum> {
     Some(match v {
         Datum::Int(x) => Datum::Int(x.checked_add(delta)?),
@@ -129,7 +144,7 @@ fn or(mut ps: Vec<Predicate>) -> Predicate {
     }
 }
 
-/// Whether `lower..=upper` can contain a value satisfying `op v`. Unknown bounds always can.
+/// `lower..=upper` の範囲に `op v` を満たす値がありうるかを返す。範囲が不明なら常にありうる。
 fn range_may_match(lower: Option<&Datum>, upper: Option<&Datum>, op: Op, v: &Datum) -> bool {
     let lo = lower.and_then(|b| b.compare(v));
     let hi = upper.and_then(|b| b.compare(v));
@@ -143,7 +158,8 @@ fn range_may_match(lower: Option<&Datum>, upper: Option<&Datum>, op: Op, v: &Dat
     }
 }
 
-/// Stage 1: tests a projected predicate against a manifest's partition summaries.
+/// 段階1: 変換済みの述語を manifest のパーティション要約で判定する。
+/// manifest を読む前に判定できるので、除外の効果が最も大きい。
 pub fn manifest_may_match(pred: &Predicate, summaries: &[FieldSummary], types: &[Type]) -> bool {
     let bounds = |pos: i32| {
         let s = summaries.get(pos as usize)?;
@@ -169,11 +185,13 @@ pub fn manifest_may_match(pred: &Predicate, summaries: &[FieldSummary], types: &
     }
 }
 
+/// 要約の対象の値がすべて null かを返す。null は比較の述語を満たさない。
 fn only_nulls(s: &FieldSummary) -> bool {
     s.contains_null && s.lower_bound.is_none() && s.contains_nan != Some(true)
 }
 
-/// Stage 2: tests a projected predicate against one file's partition tuple.
+/// 段階2: 変換済みの述語を1つのファイルのパーティションタプルで判定する。
+/// ファイル内の全行が同じタプルを持つので、ここでの判定は要約より正確になる。
 pub fn partition_matches(pred: &Predicate, partition: &[Option<Datum>]) -> bool {
     let value = |pos: i32| partition.get(pos as usize).and_then(Option::as_ref);
     match pred {
@@ -201,7 +219,8 @@ pub fn partition_matches(pred: &Predicate, partition: &[Option<Datum>]) -> bool 
     }
 }
 
-/// Stage 3: tests an unprojected predicate against one file's column metrics.
+/// 段階3: 変換前の述語を1つのファイルの列統計で判定する。
+/// パーティションにしていない列の条件でも、ファイル内の上下限で除外できる。
 pub fn metrics_may_match(pred: &Predicate, file: &DataFile, schema: &Schema) -> bool {
     let all_null = |id: i32| match (file.null_value_counts.get(&id), file.value_counts.get(&id)) {
         (Some(nulls), Some(values)) => nulls == values,
@@ -209,6 +228,7 @@ pub fn metrics_may_match(pred: &Predicate, file: &DataFile, schema: &Schema) -> 
     };
     let bounds = |id: i32| {
         let ty = schema.field(id)?.ty;
+        // [`project`] と同じ理由で、float の上下限は使わない。
         if matches!(ty, Type::Float | Type::Double) {
             return None;
         }
@@ -234,6 +254,7 @@ pub fn metrics_may_match(pred: &Predicate, file: &DataFile, schema: &Schema) -> 
                         .any(|v| range_may_match(lo.as_ref(), hi.as_ref(), Op::Eq, v))
                 })
         }
+        // null の数が不明なファイルは、null を含みうるものとして残す。
         Predicate::IsNull(id) => file.null_value_counts.get(id) != Some(&0),
         Predicate::NotNull(id) => !all_null(*id),
     }

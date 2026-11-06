@@ -1,6 +1,13 @@
-//! A catalog that lives on an object store. Each table has a pointer object at
-//! `_catalog/<namespace>/<table>.json` naming its current metadata file. Swapping that pointer
-//! with `If-Match` is the check-and-put of the spec's "Metastore Tables" commit scheme.
+//! Catalog の実装。仕様の「Metastore Tables」方式のコミットを、オブジェクトストレージだけで行う。
+//!
+//! テーブルの実体は不変のファイルなので、「現在の metadata ファイルはどれか」という1つの参照の
+//! 更新がコミットになる。仕様はこの参照を check-and-put で更新することを求める。通常は
+//! Hive Metastore などが受け持つ処理で、ここではテーブルごとに
+//! `_catalog/<namespace>/<table>.json` というポインタオブジェクトを置き、
+//! S3 の条件付き PUT で代用する。
+//!
+//! ファイル名の rename でコミットする「File System Tables」方式は使わない。
+//! 仕様が、オブジェクトストレージでは安全でないとして非推奨にしている。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,6 +25,8 @@ use crate::partition::PartitionSpec;
 use crate::table::Table;
 use crate::types::Schema;
 
+// テーブルの location は自由に指定できるので、ポインタは location の外の固定の場所にまとめる。
+// 一覧の取得はこのプレフィックスのリストで済む。
 const POINTER_ROOT: &str = "_catalog";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -48,6 +57,7 @@ impl std::fmt::Display for TableIdent {
     }
 }
 
+/// 現在の metadata ファイルの場所だけを持つ。この形式はこの実装の独自のもので、仕様にはない。
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct Pointer {
@@ -64,7 +74,7 @@ pub struct S3Config {
 }
 
 impl S3Config {
-    /// Reads `TOY_ICEBERG_*` variables, defaulting to the RustFS service in `compose.yaml`.
+    /// `TOY_ICEBERG_*` の環境変数を読む。既定値は `compose.yaml` の RustFS を指す。
     pub fn from_env() -> Self {
         let var = |name: &str, default: &str| {
             std::env::var(format!("TOY_ICEBERG_{name}")).unwrap_or_else(|_| default.to_owned())
@@ -79,6 +89,7 @@ impl S3Config {
     }
 }
 
+/// ポインタの読み書きと、ファイルの入出力の窓口。
 #[derive(Debug)]
 pub struct Catalog {
     store: Arc<dyn ObjectStore>,
@@ -109,6 +120,8 @@ impl Catalog {
         &self.store
     }
 
+    /// metadata に書かれた `s3://...` の完全なパスを、バケット内のキーに変換する。
+    /// Iceberg の metadata は他のファイルを完全なパスで参照するので、読み手はこの変換を毎回行う。
     pub fn path(&self, location: &str) -> Result<Path> {
         let key = location
             .strip_prefix("s3://")
@@ -156,6 +169,8 @@ impl Catalog {
             .collect())
     }
 
+    /// テーブルを作成する。最初の metadata ファイルを書いてから、ポインタを `PutMode::Create`
+    /// （`If-None-Match: *`）で作る。同名のテーブルを同時に作っても、成功するのは1つだけである。
     pub async fn create_table(
         self: &Arc<Self>,
         ident: &TableIdent,
@@ -189,6 +204,8 @@ impl Catalog {
         }
     }
 
+    /// ポインタをたどって現在の metadata を読む。ポインタの ETag も覚えておく。
+    /// `Catalog::commit` は、この ETag から変わっていないことを条件にポインタを更新する。
     pub async fn load_table(self: &Arc<Self>, ident: &TableIdent) -> Result<Table> {
         let result = match self.store.get(&ident.pointer_path()).await {
             Ok(r) => r,
@@ -209,9 +226,9 @@ impl Catalog {
         ))
     }
 
-    /// Removes the table from the catalog. Data and metadata files stay in place.
+    /// テーブルを Catalog から外す。data file と metadata ファイルは残す。
     pub async fn drop_table(&self, ident: &TableIdent) -> Result<()> {
-        // S3 deletes succeed on missing keys, so existence has to be checked separately.
+        // S3 の DELETE は存在しないキーでも成功するので、存在の確認を別に行う。
         let path = ident.pointer_path();
         match self.store.head(&path).await {
             Err(object_store::Error::NotFound { .. }) => {
@@ -222,8 +239,14 @@ impl Catalog {
         Ok(self.store.delete(&path).await?)
     }
 
-    /// Publishes `metadata` if the pointer is still at `base`; otherwise returns
-    /// [`Error::CommitConflict`] and the caller must rebuild from fresh metadata.
+    /// ポインタが `base` の状態のままなら `metadata` を公開する。変わっていれば
+    /// [`Error::CommitConflict`] を返すので、呼び出し側は最新の metadata から作り直す。
+    ///
+    /// 仕様の「Metastore Tables」の手順そのもので、次の順に処理する。
+    ///
+    /// 1. 新しい metadata ファイルを一意な名前で書く。
+    /// 2. ポインタを `If-Match` 付きの PUT で差し替える。これがコミットの瞬間である。
+    /// 3. PUT が 412 を返したら失敗とする。手順1のファイルはどこからも参照されないまま残る。
     pub(crate) async fn commit(&self, base: &Table, mut metadata: TableMetadata) -> Result<()> {
         metadata.metadata_log.push(MetadataLogEntry {
             metadata_file: base.metadata_location().to_owned(),
@@ -252,6 +275,8 @@ impl Catalog {
         }
     }
 
+    /// 仕様の命名規則 `<V>-<random-uuid>.metadata.json` で書く。UUID があるので、同じバージョンを
+    /// 同時に書く書き手どうしが上書きし合うことはない。
     async fn write_metadata(&self, metadata: &TableMetadata) -> Result<String> {
         let location = format!(
             "{}/metadata/{:05}-{}.metadata.json",
@@ -265,7 +290,7 @@ impl Catalog {
     }
 }
 
-/// `Path` percent-encodes characters such as non-ASCII letters in the segments it returns.
+/// `Path` が返すセグメントは、非 ASCII 文字などがパーセントエンコードされている。
 fn decode_segment(segment: &str) -> String {
     percent_decode_str(segment).decode_utf8_lossy().into_owned()
 }

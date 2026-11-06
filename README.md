@@ -2,6 +2,8 @@
 
 Apache Iceberg のテーブルフォーマットを学ぶための小さな Rust 実装です。クエリエンジンに Apache DataFusion、ストレージに RustFS を使います。
 
+実装の読み方は [docs/walkthrough.md](docs/walkthrough.md) にまとめています。
+
 ## 構成
 
 | クレート | 役割 |

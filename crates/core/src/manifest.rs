@@ -1,6 +1,11 @@
-//! Avro encoding of manifests and manifest lists. The writer schemas follow the field ids in the
-//! spec; readers look fields up by name, so foreign files with extra fields still parse.
-
+//! manifest と manifest list の Avro 表現。仕様の「Manifests」「Manifest Lists」を実装する。
+//!
+//! manifest は data file の一覧で、ファイルごとにパーティション値と列統計を持つ。
+//! manifest list は1つの snapshot に属する manifest の一覧で、manifest ごとにパーティションの
+//! 要約を持つ。読み手はこの2段の要約を使い、data file を開かずに読む対象を絞る。
+//!
+//! 書くときのスキーマは仕様の field id に従う。読むときはフィールド名で探すので、
+//! 他の実装が余分なフィールドを足したファイルも解析できる。
 use std::collections::{BTreeMap, HashMap};
 
 use apache_avro::schema::UnionSchema;
@@ -13,11 +18,18 @@ use crate::partition::PartitionSpec;
 use crate::types::{Schema, Type};
 use crate::values::Datum;
 
+// manifest entry の状態。仕様の「Manifest Entry Fields」の `status` にあたる。
+// `ADDED` はこの manifest を書いた snapshot が追加したファイル、`EXISTING` は以前の snapshot から
+// 引き継いだファイル、`DELETED` はこの snapshot で削除したファイルを表す。
 pub const STATUS_EXISTING: i32 = 0;
 pub const STATUS_ADDED: i32 = 1;
 pub const STATUS_DELETED: i32 = 2;
+// データファイルの種別。1 と 2 は delete file で、この実装は読み書きしない。
 pub const CONTENT_DATA: i32 = 0;
 
+/// manifest 内の全ファイルについて、パーティションタプルの1要素を要約した値。
+/// 仕様の「Manifest Lists」の `field_summary` にあたり、manifest ごとの pruning に使う。
+/// 上下限には null と NaN を含めず、その有無を別のフラグで持つ。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FieldSummary {
     pub contains_null: bool,
@@ -26,12 +38,14 @@ pub struct FieldSummary {
     pub upper_bound: Option<Vec<u8>>,
 }
 
+/// manifest list の1行。1つの manifest の場所と要約を持つ。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManifestFile {
     pub path: String,
     pub length: i64,
     pub partition_spec_id: i32,
     pub content: i32,
+    /// manifest 内の `null` の sequence number は、読むときにこの値で補う。
     pub sequence_number: i64,
     pub min_sequence_number: i64,
     pub added_snapshot_id: i64,
@@ -41,31 +55,44 @@ pub struct ManifestFile {
     pub added_rows_count: i64,
     pub existing_rows_count: i64,
     pub deleted_rows_count: i64,
+    /// パーティションタプルと同じ順序で並ぶ。
     pub partitions: Vec<FieldSummary>,
+    /// v3 の row lineage で、この manifest の先頭のファイルに割り当てる row id。
     pub first_row_id: Option<i64>,
 }
 
+/// 1つの data file の情報。仕様の「Manifest Entry Fields」の `data_file` にあたる。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataFile {
     pub content: i32,
     pub file_path: String,
     pub file_format: String,
+    /// ファイル内の全行に共通のパーティションタプル。
     pub partition: Vec<Option<Datum>>,
     pub record_count: i64,
     pub file_size_in_bytes: i64,
+    /// 以降の統計のキーは列の field id。`value_counts` は null と NaN も数える。
     pub value_counts: BTreeMap<i32, i64>,
     pub null_value_counts: BTreeMap<i32, i64>,
     pub nan_value_counts: BTreeMap<i32, i64>,
+    /// 上下限は [`Datum::to_bytes`] のバイト列で持ち、null と NaN を含めない。
     pub lower_bounds: BTreeMap<i32, Vec<u8>>,
     pub upper_bounds: BTreeMap<i32, Vec<u8>>,
+    /// v3 の row lineage で、このファイルの先頭の行の row id。
     pub first_row_id: Option<i64>,
 }
 
+/// manifest の1行。
+///
+/// `snapshot_id` と2つの sequence number が `Option` なのは、仕様が `null` を「manifest list の値を
+/// 継承する」という意味に定めているからである（「Sequence Number Inheritance」）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManifestEntry {
     pub status: i32,
     pub snapshot_id: Option<i64>,
+    /// データの論理的な新しさを表す。delete file の適用範囲の判定に使う値である。
     pub sequence_number: Option<i64>,
+    /// ファイルをテーブルに追加したコミットの番号。
     pub file_sequence_number: Option<i64>,
     pub data_file: DataFile,
 }
@@ -74,6 +101,7 @@ fn opt(ty: Json) -> Json {
     json!(["null", ty])
 }
 
+/// 仕様の「Appendix A」の Avro の節は、各フィールドに `field-id` を付けることを求める。
 fn field(id: i32, name: &str, ty: Json) -> Json {
     json!({"name": name, "type": ty, "field-id": id})
 }
@@ -82,7 +110,8 @@ fn opt_field(id: i32, name: &str, ty: Json) -> Json {
     json!({"name": name, "type": opt(ty), "default": null, "field-id": id})
 }
 
-/// Iceberg stores maps with non-string keys as an array of key/value records.
+/// Avro の map はキーが文字列に限られる。そのため Iceberg は、キーが int の map を
+/// key と value のレコードの配列として保存する。
 fn int_map(key_id: i32, value_id: i32, value: &str) -> Json {
     json!({
         "type": "array",
@@ -95,6 +124,7 @@ fn int_map(key_id: i32, value_id: i32, value: &str) -> Json {
     })
 }
 
+/// 仕様の「Appendix A」の Avro 型の対応。`adjust-to-utc` が timestamp と timestamptz を区別する。
 fn avro_type(ty: Type) -> Json {
     match ty {
         Type::Boolean => json!("boolean"),
@@ -114,14 +144,17 @@ fn avro_type(ty: Type) -> Json {
     }
 }
 
-/// `Schema::parse` drops custom attributes on arrays, which readers need: the spec requires
-/// `logicalType: map` on integer-keyed maps, and list elements carry their field id.
+/// `apache_avro` の `Schema::parse` は配列のカスタム属性を捨てるので、解析後に復元する。
+/// 読み手はこの属性を必要とする。仕様は int キーの map に `logicalType: map` を要求し、
+/// リストの要素は `element-id` で field id を持つからである。
 fn parse_schema(json: &Json) -> Result<AvroSchema> {
     let mut schema = AvroSchema::parse(json)?;
     restore_array_attributes(&mut schema)?;
     Ok(schema)
 }
 
+/// 配列の要素レコードの名前で属性を決める。この実装が書く配列のうち、リストは manifest list の
+/// `partitions`（要素 `r508`）だけで、それ以外は [`int_map`] が作った map である。
 fn restore_array_attributes(schema: &mut AvroSchema) -> Result<()> {
     match schema {
         AvroSchema::Record(r) => {
@@ -151,7 +184,8 @@ fn restore_array_attributes(schema: &mut AvroSchema) -> Result<()> {
     Ok(())
 }
 
-/// Same scheme as Java's `AvroSchemaUtil.makeCompatibleName`.
+/// パーティション名を Avro のフィールド名に使える形に変える。Avro の名前は使える文字が限られる。
+/// Java の `AvroSchemaUtil.makeCompatibleName` と同じ方式で、元の名前は `iceberg-field-name` に残す。
 fn avro_name(name: &str) -> String {
     let mut out = String::new();
     for (i, c) in name.chars().enumerate() {
@@ -167,6 +201,8 @@ fn avro_name(name: &str) -> String {
     out
 }
 
+/// manifest の Avro スキーマ。`partition` レコードの形はパーティション定義ごとに変わるので、
+/// 固定のスキーマではなく定義から組み立てる。この関数の field id はすべて仕様で決まっている。
 fn manifest_schema(
     spec: &PartitionSpec,
     types: &[Type],
@@ -216,6 +252,7 @@ fn manifest_schema(
     parse_schema(&schema)
 }
 
+/// manifest list の Avro スキーマ。この関数の field id も仕様で決まっている。
 fn manifest_list_schema(format_version: i32) -> Result<AvroSchema> {
     let summary = json!({
         "type": "record",
@@ -319,6 +356,10 @@ fn entry_value(e: &ManifestEntry, spec: &PartitionSpec, format_version: i32) -> 
     ])
 }
 
+/// manifest を Avro のバイト列にする。
+///
+/// 仕様の「Manifests」は、スキーマとパーティション定義を Avro ファイルのメタデータに書くことを
+/// 求める。これにより、manifest は metadata ファイルがなくても単独で解釈できる。
 pub fn write_manifest(
     entries: &[ManifestEntry],
     schema: &Schema,
@@ -343,6 +384,7 @@ pub fn write_manifest(
     Ok(w.into_inner()?)
 }
 
+/// manifest list の Avro メタデータに書く値。仕様の「Manifest Lists」が定める。
 pub struct ManifestListHeader {
     pub snapshot_id: i64,
     pub parent_snapshot_id: Option<i64>,
@@ -488,8 +530,11 @@ fn read_map<V>(
         .collect()
 }
 
-/// Reads a manifest and resolves the values that added entries inherit from `manifest`:
-/// snapshot id, sequence numbers and, in v3, `first_row_id`.
+/// manifest を読み、`manifest` から継承する値を解決する。
+///
+/// 継承するのは snapshot id、2つの sequence number、v3 の `first_row_id` である
+/// （「Sequence Number Inheritance」「First Row ID Inheritance」）。sequence number の継承は
+/// `ADDED` の entry に限る。`EXISTING` と `DELETED` の entry は値を明示的に持つことを仕様が求めている。
 pub fn read_manifest(
     bytes: &[u8],
     partition_types: &[Type],
@@ -516,7 +561,8 @@ pub fn read_manifest(
         let partition = read_partition(required(&f, "partition")?, partition_types)?;
         let record_count = as_i64(required(&f, "record_count")?)?;
         let mut first_row_id = optional(&f, "first_row_id").map(as_i64).transpose()?;
-        // Only a file that inherits consumes row ids; one with a value keeps its earlier range.
+        // row id を消費するのは継承するファイルだけで、値を持つファイルは以前の範囲を保つ。
+        // 仕様どおり、前のファイルの `record_count` を足して次の値を求める。
         if status != STATUS_DELETED && first_row_id.is_none() {
             first_row_id = next_row_id;
             next_row_id = next_row_id.map(|id| id + record_count);
@@ -545,6 +591,8 @@ pub fn read_manifest(
     Ok(entries)
 }
 
+/// パーティションレコードのフィールドを名前ではなく位置で型と対応づける。
+/// 名前は Avro 用に変換されている場合があり（[`avro_name`]）、位置は定義の順序と一致するからである。
 fn read_partition(v: &Value, types: &[Type]) -> Result<Vec<Option<Datum>>> {
     let Value::Record(fs) = strip_union(v) else {
         return invalid("expected partition record");
@@ -572,7 +620,7 @@ pub fn read_manifest_list(bytes: &[u8]) -> Result<Vec<ManifestFile>> {
         let m = fields(&value)?;
         let int = |n: &str| as_i32(required(&m, n)?);
         let long = |n: &str| as_i64(required(&m, n)?);
-        // Some writers use the older `*_data_files_count` names for field ids 504 to 506.
+        // 古い書き手は、field id 504〜506 に `*_data_files_count` という名前を使う。
         let count = |kind: &str| {
             let legacy = format!("{kind}_data_files_count");
             match optional(&m, &legacy) {
@@ -590,6 +638,7 @@ pub fn read_manifest_list(bytes: &[u8]) -> Result<Vec<ManifestFile>> {
                         _ => None,
                     };
                     Ok(FieldSummary {
+                        // 不明な場合は null があるものとして扱う。pruning で除外しない側である。
                         contains_null: flag("contains_null").unwrap_or(true),
                         contains_nan: flag("contains_nan"),
                         lower_bound: optional(&s, "lower_bound").map(as_bytes).transpose()?,

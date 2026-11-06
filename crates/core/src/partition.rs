@@ -1,11 +1,20 @@
+//! パーティション定義。仕様の「Partitioning」を実装する。
+//!
+//! パーティション定義は「どの列にどの transform を適用するか」のリストである。
+//! data file ごとに、この定義で計算した値の組（パーティションタプル）を manifest に記録する。
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, invalid};
 use crate::transform::Transform;
 use crate::types::{Schema, Type};
 
+// パーティションフィールドの ID は、スキーマの field id とは別に 1000 から割り当てる。
+// 参照実装が 1000 からの連番を使ってきたことに合わせている（仕様の「Partition Evolution」）。
 const FIRST_PARTITION_FIELD_ID: i32 = 1000;
 
+/// パーティションタプルの1要素。`source_id` は元の列の field id で、列名の変更の影響を受けない。
+/// `field_id` と `name` は manifest の Avro スキーマの `partition` レコードに現れる。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PartitionField {
@@ -15,6 +24,8 @@ pub struct PartitionField {
     pub transform: Transform,
 }
 
+/// パーティション定義の1バージョン。manifest は `spec_id` で自分を書いたときの定義を指す。
+/// この実装はパーティション進化に対応しないので、作成するテーブルの `spec_id` は常に 0 になる。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PartitionSpec {
@@ -23,6 +34,7 @@ pub struct PartitionSpec {
 }
 
 impl PartitionSpec {
+    /// パーティションなしのテーブルは、フィールドが空の定義で表す。
     pub fn unpartitioned() -> Self {
         PartitionSpec {
             spec_id: 0,
@@ -30,7 +42,8 @@ impl PartitionSpec {
         }
     }
 
-    /// Parses a comma-separated list such as `day(ts), bucket(16, id), truncate(4, s), region`.
+    /// `day(ts), bucket(16, id), truncate(4, s), region` のようなカンマ区切りの定義を解析する。
+    /// この構文は SQL の `OPTIONS` で使うこの実装独自のもので、仕様の一部ではない。
     pub fn parse(expr: &str, schema: &Schema) -> Result<Self> {
         let mut fields: Vec<PartitionField> = Vec::new();
         for term in split_top_level(expr) {
@@ -49,7 +62,8 @@ impl PartitionSpec {
                 Transform::Hour => format!("{}_hour", source.name),
                 Transform::Void => format!("{}_null", source.name),
             };
-            // Java refuses to load a table whose partition name shadows a different column.
+            // Java 実装は、パーティション名が別の列を隠すテーブルの読み込みを拒否する。
+            // 他の実装で読めないテーブルを作らないよう、作成時に弾く。
             let shadows = schema
                 .field_by_name(&name)
                 .is_some_and(|c| c.id != source.id || transform != Transform::Identity);
@@ -69,6 +83,7 @@ impl PartitionSpec {
         Ok(PartitionSpec { spec_id: 0, fields })
     }
 
+    /// パーティションタプルの各要素の型。manifest の読み書きに必要になる。
     pub fn partition_type(&self, schema: &Schema) -> Result<Vec<Type>> {
         self.fields
             .iter()
@@ -90,6 +105,7 @@ impl PartitionSpec {
     }
 }
 
+/// 括弧の外のカンマだけで分割する。`bucket(16, id)` の内側のカンマで切らないためである。
 fn split_top_level(expr: &str) -> Vec<&str> {
     let mut terms = Vec::new();
     let (mut depth, mut start) = (0, 0);

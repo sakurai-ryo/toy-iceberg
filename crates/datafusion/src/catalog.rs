@@ -1,3 +1,8 @@
+//! Iceberg の Catalog を DataFusion のカタログに対応づける。
+//!
+//! namespace が DataFusion のスキーマにあたる。テーブルの実体は毎回 core の Catalog から読むので、
+//! 別のプロセスのコミットも次のクエリから見える。
+
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -12,8 +17,8 @@ use crate::inspect::metadata_table;
 use crate::table::IcebergTable;
 use crate::to_df;
 
-/// Namespaces exist implicitly: a schema provider is handed out for any name, and the
-/// namespace appears in the store once a table is created in it.
+/// namespace は暗黙に存在する。どの名前にもスキーマプロバイダを返し、その namespace は
+/// テーブルを作ったときにストレージ上に現れる。
 #[derive(Debug)]
 pub struct IcebergCatalogProvider {
     catalog: Arc<Catalog>,
@@ -21,8 +26,8 @@ pub struct IcebergCatalogProvider {
 }
 
 impl IcebergCatalogProvider {
-    /// DataFusion's `schema_names` and `table_exist` are synchronous, so the listing is read
-    /// here. Commits that other processes make later only change what those two report.
+    /// DataFusion の `schema_names` と `table_exist` は同期関数なので、一覧はここで読んでおく。
+    /// 他のプロセスがあとで行うコミットの影響は、この2つの結果に限られる。
     pub async fn load(catalog: Arc<Catalog>) -> Result<Self> {
         let mut schemas = BTreeMap::new();
         for namespace in catalog.list_namespaces().await.map_err(to_df)? {
@@ -95,6 +100,7 @@ impl SchemaProvider for IcebergSchemaProvider {
         self.tables.lock().unwrap().iter().cloned().collect()
     }
 
+    // 名前の接尾辞でテーブルの種類を決める。metadata はこの呼び出しのたびに読み直す。
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
         if let Some((base, kind)) = name.split_once('$') {
             let Some(table) = self.load(base).await? else {
@@ -118,9 +124,9 @@ impl SchemaProvider for IcebergSchemaProvider {
         self.tables.lock().unwrap().contains(name)
     }
 
-    /// `CREATE EXTERNAL TABLE` calls this after the factory has already created the table in
-    /// the catalog, so only the local listing changes. Anything else would be lost, because
-    /// this catalog stores nothing but Iceberg tables.
+    /// `CREATE EXTERNAL TABLE` は、ファクトリが Catalog にテーブルを作ったあとでこれを呼ぶので、
+    /// 変わるのはローカルの一覧だけである。この Catalog は Iceberg のテーブルしか保存しないので、
+    /// それ以外を受け入れると、登録したものが失われてしまう。
     fn register_table(
         &self,
         name: String,
@@ -135,8 +141,8 @@ impl SchemaProvider for IcebergSchemaProvider {
         Ok(None)
     }
 
-    /// Refuses, so that `CREATE OR REPLACE` fails before it can lose the existing table.
-    /// See [`crate::IcebergSession`] for `DROP TABLE`.
+    /// 拒否する。`CREATE OR REPLACE` が既存のテーブルを失う前に失敗するようにするためである。
+    /// `DROP TABLE` については [`crate::IcebergSession`] を参照。
     fn deregister_table(&self, _name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
         Err(DataFusionError::NotImplemented(
             "replacing a table is not supported; run DROP TABLE through IcebergSession::sql".into(),

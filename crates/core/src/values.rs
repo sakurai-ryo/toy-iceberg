@@ -1,3 +1,8 @@
+//! 単一の値の表現と、各形式との変換。
+//!
+//! 同じ値が、manifest の Avro、統計の上下限のバイト列（「Appendix D」）、Arrow の配列という
+//! 3つの形で現れる。[`Datum`] はこれらの間の共通の表現である。
+
 use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
@@ -18,7 +23,9 @@ use crate::types::Type;
 
 pub(crate) const UNIX_EPOCH_DAYS_FROM_CE: i32 = 719_163;
 
-/// A single non-null value. Dates are days and timestamps are microseconds from the Unix epoch.
+/// null でない単一の値。パーティション値や統計の上下限を表す。
+/// date は Unix エポックからの日数、timestamp はマイクロ秒で、仕様の保存形式と同じ単位を使う。
+/// null は `Option<Datum>` の `None` で表す。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Datum {
     Boolean(bool),
@@ -49,7 +56,9 @@ impl Datum {
         }
     }
 
-    /// Binary single-value serialization (spec Appendix D).
+    /// 仕様の「Binary single-value serialization」（Appendix D）。manifest の `lower_bounds`、
+    /// `upper_bounds` と、manifest list の `lower_bound`、`upper_bound` はこのバイト列で保存する。
+    /// 統計を型に依存しない `bytes` として持つので、値の解釈には列の型が必要になる（[`Datum::from_bytes`]）。
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Datum::Boolean(v) => vec![*v as u8],
@@ -74,7 +83,8 @@ impl Datum {
         Ok(match ty {
             Type::Boolean => Datum::Boolean(fixed::<1>(ty, b)?[0] != 0),
             Type::Int => Datum::Int(i32::from_le_bytes(fixed(ty, b)?)),
-            // Schema promotion lets a bound written as int be read for a long column.
+            // 仕様のスキーマ進化は int から long、float から double への昇格を認める。
+            // 昇格前に書かれたファイルの統計は4バイトのままなので、長さで判別する。
             Type::Long if b.len() == 4 => Datum::Long(i32::from_le_bytes(fixed(ty, b)?) as i64),
             Type::Long => Datum::Long(i64::from_le_bytes(fixed(ty, b)?)),
             Type::Float => Datum::Float(f32::from_le_bytes(fixed(ty, b)?)),
@@ -91,8 +101,9 @@ impl Datum {
         })
     }
 
-    /// `None` when the two values have different types. Floats use IEEE 754 totalOrder,
-    /// which the spec requires so that `-0.0` sorts before `+0.0` in bounds.
+    /// 2つの値の型が異なるときは `None` を返す。呼び出し側は比較できないものを「除外しない」側に倒す。
+    /// float は IEEE 754 の totalOrder で比べる。統計の上下限で `-0.0` を `+0.0` より前に
+    /// 並べることを仕様が求めているためである。
     pub fn compare(&self, other: &Datum) -> Option<Ordering> {
         Some(match (self, other) {
             (Datum::Boolean(a), Datum::Boolean(b)) => a.cmp(b),
@@ -129,7 +140,7 @@ impl Datum {
             (Type::Long, Value::Long(v)) => Datum::Long(*v),
             (Type::Float, Value::Float(v)) => Datum::Float(*v),
             (Type::Double, Value::Double(v)) => Datum::Double(*v),
-            // The spec requires readers to accept int for the day transform's date result.
+            // day transform の結果は date 型だが、int として書かれたファイルも読むことを仕様が求めている。
             (Type::Date, Value::Date(v) | Value::Int(v)) => Datum::Date(*v),
             (Type::Timestamp, Value::TimestampMicros(v) | Value::Long(v)) => Datum::Timestamp(*v),
             (Type::Timestamptz, Value::TimestampMicros(v) | Value::Long(v)) => {
@@ -163,6 +174,7 @@ impl Datum {
         })
     }
 
+    /// 全行が同じ値の配列を作る。data file に存在しない列を埋めるときに使う。
     pub(crate) fn constant_array(value: Option<&Datum>, ty: Type, len: usize) -> ArrayRef {
         let Some(value) = value else {
             return new_null_array(&arrow_type(ty), len);

@@ -1,3 +1,8 @@
+//! Iceberg のスキーマと Arrow のスキーマの変換。
+//!
+//! Arrow はメモリ上の表現で、Parquet の読み書きと DataFusion との受け渡しに使う。
+//! Iceberg の日時はマイクロ秒精度なので、`timestamp` は Arrow でも `Microsecond` にそろえる。
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -22,7 +27,9 @@ pub fn arrow_type(ty: Type) -> DataType {
     }
 }
 
-/// `PARQUET:field_id` metadata makes `ArrowWriter` record Iceberg field ids in the file.
+/// `PARQUET:field_id` メタデータを付けると、`ArrowWriter` が Iceberg の field id をファイルに記録する。
+/// 仕様の「Appendix A」の Parquet の節は、列に field id を持たせることを要求している。
+/// 読み手はこの ID で列を探す（[`crate::scan::read_task`]）。
 pub fn arrow_field(f: &Field) -> ArrowField {
     ArrowField::new(&f.name, arrow_type(f.ty), !f.required).with_metadata(HashMap::from([(
         PARQUET_FIELD_ID_META_KEY.to_owned(),
@@ -36,7 +43,8 @@ pub fn arrow_schema(fields: &[Field]) -> SchemaRef {
     ))
 }
 
-/// Builds a new table schema, assigning field ids from 1 in column order.
+/// 新しいテーブルのスキーマを作る。field id は列の順に 1 から割り当てる。
+/// 既存のテーブルには使えない。field id は一度割り当てたら変えられないからである。
 pub fn schema_from_arrow(schema: &ArrowSchema) -> Result<Schema> {
     let fields = schema
         .fields()

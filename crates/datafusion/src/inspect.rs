@@ -1,3 +1,8 @@
+//! メタデータテーブル（`t$snapshots`、`t$manifests`、`t$files`）。
+//!
+//! 仕様の一部ではなく、Spark などのエンジンが提供する機能に相当する。
+//! metadata と manifest の内容を SQL で確認するためにある。内容は小さいので、メモリ上の表にする。
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -31,7 +36,8 @@ pub(crate) async fn metadata_table(table: &Table, kind: &str) -> Result<Arc<dyn 
     Ok(Arc::new(MetadataTable(table)))
 }
 
-/// `MemTable` accepts inserts, which here would report success and change nothing.
+/// `MemTable` は INSERT を受け付ける。ここでは成功を報告しながら何も変わらないことになるので、
+/// `insert_into` を持たないラッパーで包む。
 #[derive(Debug)]
 struct MetadataTable(MemTable);
 

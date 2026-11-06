@@ -1,3 +1,5 @@
+//! DataFusion の式を、pruning 用の [`Predicate`] に変換する。
+
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
@@ -5,8 +7,8 @@ use toy_iceberg_core::expr::{Op, Predicate};
 use toy_iceberg_core::types::{Field, Schema, Type};
 use toy_iceberg_core::values::Datum;
 
-/// Converts pushed-down filters for file pruning. DataFusion re-applies the filters to the rows
-/// read, so an expression that cannot be converted only prunes less.
+/// 押し下げられたフィルタを、ファイルの pruning 用に変換する。DataFusion は読んだ行に
+/// 同じフィルタを再度適用するので、変換できない式があっても除外が減るだけで済む。
 pub(crate) fn to_predicate(filters: &[Expr], schema: &Schema) -> Predicate {
     let terms: Vec<_> = filters
         .iter()
@@ -18,9 +20,9 @@ pub(crate) fn to_predicate(filters: &[Expr], schema: &Schema) -> Predicate {
     }
 }
 
-/// Dropping a conjunct weakens a filter, which is safe; dropping a disjunct strengthens it, which
-/// is not. Negation is pushed down during conversion so that this rule is decided on the
-/// connective that remains after De Morgan.
+/// AND の項を捨てるとフィルタは緩むので安全だが、OR の項を捨てるとフィルタが厳しくなるので
+/// 安全でない。否定を変換の途中で内側へ押し込むのは、ド・モルガンの法則を適用したあとに残る
+/// 接続詞でこの規則を判断するためである。
 fn convert(e: &Expr, schema: &Schema, negated: bool) -> Option<Predicate> {
     match e {
         Expr::Not(inner) => convert(inner, schema, !negated),
