@@ -13,6 +13,28 @@ Apache Iceberg のテーブルフォーマットを学ぶための小さな Rust
 | `crates/cli` | SQL を1文実行する `toy-iceberg` バイナリ |
 | `crates/integration_tests` | 公式 fixtures、`iceberg-rust` からの移植テスト、RustFS 上の結合テスト |
 
+## MySQL との対応
+
+MySQL に置き換えると、DataFusion がサーバー層、`crates/core` が InnoDB におおよそ対応します。次の表は役割の類推で、同じ仕組みを指すものではありません。
+
+| MySQL | toy-iceberg |
+|---|---|
+| パーサ、オプティマイザ、エグゼキュータ | DataFusion |
+| handler API | `TableProvider`、`DataSink` の実装 |
+| InnoDB | `crates/core` |
+| `.ibd` のページ | Parquet ファイル |
+| データディクショナリ | metadata file（スキーマ、パーティション定義） |
+| MVCC の read view | snapshot |
+| コミット | ポインタの条件付き PUT |
+| Index Condition Pushdown | manifest と統計による pruning |
+
+一方で、次の点は InnoDB と異なります。
+
+- Iceberg の本体はファイル形式と仕様です。バッファプール、ロック、redo log を持つ常駐プロセスはなく、`crates/core` は呼び出し側のプロセス内で動くライブラリです。
+- 複数のエンジンが同じテーブルを読み書きできます。
+- ロックを取らずに書き、ポインタの更新で競合したらやり直します。
+- B+Tree のようなインデックスはなく、統計で読まなくてよいファイルを除外します。
+
 ## 使い方
 
 ```sh
