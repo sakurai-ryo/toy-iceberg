@@ -1578,9 +1578,9 @@ pub(crate) fn to_predicate(filters: &[Expr], schema: &Schema) -> Predicate {
 }
 ```
 
-`filters` の要素は暗黙に AND で結ばれているので、変換できない要素は `filter_map` で捨てて構いません
+`filters` の要素は暗黙に AND で結ばれているので、変換できない要素は `filter_map` で捨てて構いません。
 
-。AND の項を捨てると条件が緩むだけで、含みうるファイルを除外しないからです。
+AND の項を捨てると条件が緩むだけで、含みうるファイルを除外しないからです。
 
 `ts >= ...` は `convert` の比較の分岐に進みます。
 
