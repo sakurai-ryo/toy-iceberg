@@ -68,6 +68,7 @@ impl TableProviderFactory for IcebergTableFactory {
                 "column defaults, WITH ORDER and constraints are not supported".into(),
             ));
         }
+
         let table_name = cmd.name.table();
         // `$` と `@` はメタデータテーブルとタイムトラベルの名前解決に使うので、テーブル名に許可しない。
         if table_name.contains(['$', '@']) {
@@ -75,6 +76,7 @@ impl TableProviderFactory for IcebergTableFactory {
                 "{table_name:?} contains a character reserved for metadata tables and time travel"
             )));
         }
+
         let schema = schema_from_arrow(cmd.schema.as_arrow()).map_err(to_df)?;
         // DataFusion は、ドットを含まないオプションのキーに `format.` を付ける。
         let mut properties: BTreeMap<_, _> = cmd

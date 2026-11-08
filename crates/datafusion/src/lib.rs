@@ -81,9 +81,11 @@ pub async fn session(catalog: Arc<Catalog>) -> Result<IcebergSession> {
     let mut config = SessionConfig::new()
         .with_default_catalog_and_schema(CATALOG_NAME, DEFAULT_NAMESPACE)
         .with_create_default_catalog_and_schema(false);
+
     // セッションにタイムゾーンがないと、SQL の `TIMESTAMPTZ` はタイムゾーンなしの timestamp になる。
     // Iceberg の `timestamptz` は UTC で保存するので、セッションも UTC にする。
     config.options_mut().execution.time_zone = Some("UTC".to_owned());
+
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()
@@ -95,6 +97,7 @@ pub async fn session(catalog: Arc<Catalog>) -> Result<IcebergSession> {
     let ctx = SessionContext::new_with_state(state);
     let provider = Arc::new(IcebergCatalogProvider::load(catalog.clone()).await?);
     ctx.register_catalog(CATALOG_NAME, provider.clone());
+
     Ok(IcebergSession {
         ctx,
         catalog,

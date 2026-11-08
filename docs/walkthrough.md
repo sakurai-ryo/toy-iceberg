@@ -1,8 +1,12 @@
 # コードで追う toy-iceberg
 
-この文書は、1つのテーブルに SQL を実行したときの処理を、CLI の `main` からオブジェクトストレージへの PUT まで、呼び出しの順に追います。Iceberg の知識は前提にしません。用語は処理の中で初めて現れたところで説明します。
+この文書は、1つのテーブルに SQL を実行したときの処理を、CLI の `main` からオブジェクトストレージへの PUT まで、呼び出しの順に追います。
 
-コードの引用は、コードブロックの直前に示したファイルからの抜粋です。`// ...` は省略を表します。場所は行番号ではなくシンボル名（`Table::append` など）で示します。「仕様の『〜』」は [Iceberg Table Spec](https://iceberg.apache.org/spec/) の節名です。
+Iceberg の知識は前提にしません。用語は処理の中で初めて現れたところで説明します。
+
+コードの引用は、コードブロックの直前に示したファイルからの抜粋です。`// ...` は省略を表します。場所は行番号ではなくシンボル名（`Table::append` など）で示します。
+
+「仕様の『〜』」は [Iceberg Table Spec](https://iceberg.apache.org/spec/) の節名です。
 
 ## 目次
 
@@ -23,7 +27,9 @@
 
 ## 1. 題材の SQL とファイルの全体像
 
-この文書では、次の SQL を順に実行したときの処理を追います。`mise run up` で RustFS を起動し、`mise run sql "<SQL>"` で1文ずつ実行すれば同じ状態を再現できます。出力例はこの手順で得た実際の値です。UUID、snapshot id、時刻は実行ごとに変わります。
+この文書では、次の SQL を順に実行したときの処理を追います。`mise run up` で RustFS を起動し、`mise run sql "<SQL>"` で1文ずつ実行すれば同じ状態を再現できます。
+
+出力例はこの手順で得た実際の値です。UUID、snapshot id、時刻は実行ごとに変わります。
 
 ```sql
 CREATE EXTERNAL TABLE tour.events (id BIGINT NOT NULL, ts TIMESTAMP, name VARCHAR)
@@ -58,7 +64,11 @@ tour/events/metadata/snap-<snapshot-id>-2-<uuid>.avro
 tour/events/metadata/snap-<snapshot-id>-3-<uuid>.avro
 ```
 
-これらのファイルでは、上の階層が下の階層のパスを持ちます。次の図は、現在の snapshot（ある時点のテーブルの内容）から1本の経路をたどったものです。実際には metadata ファイルがすべての snapshot の manifest list を指し、1つの manifest を複数の manifest list が参照するので、全体は厳密な木ではありません。
+これらのファイルでは、上の階層が下の階層のパスを持ちます。
+
+次の図は、現在の snapshot（ある時点のテーブルの内容）から1本の経路をたどったものです。
+
+実際には metadata ファイルがすべての snapshot の manifest list を指し、1つの manifest を複数の manifest list が参照するので、全体は厳密な木ではありません。
 
 ```text
 ポインタ                  _catalog/tour/events.json
@@ -68,23 +78,27 @@ tour/events/metadata/snap-<snapshot-id>-3-<uuid>.avro
               └ data file <uuid>.parquet               行データ
 ```
 
-| 階層 | 形式 | Rust の型 | 読むコード | 書くコード |
-|---|---|---|---|---|
-| ポインタ | JSON | `Pointer` | `Catalog::load_table` | `Catalog::create_table`、`Catalog::commit` |
-| metadata ファイル | JSON | `TableMetadata`、`Snapshot` | `TableMetadata::parse` | `Catalog::write_metadata` |
-| manifest list | Avro | `ManifestFile`、`FieldSummary` | `read_manifest_list` | `write_manifest_list` |
-| manifest | Avro | `ManifestEntry`、`DataFile` | `read_manifest` | `write_manifest` |
-| data file | Parquet | `RecordBatch` | `read_task` | `write_file` |
+| 階層              | 形式    | Rust の型                      | 読むコード             | 書くコード                                 |
+| ----------------- | ------- | ------------------------------ | ---------------------- | ------------------------------------------ |
+| ポインタ          | JSON    | `Pointer`                      | `Catalog::load_table`  | `Catalog::create_table`、`Catalog::commit` |
+| metadata ファイル | JSON    | `TableMetadata`、`Snapshot`    | `TableMetadata::parse` | `Catalog::write_metadata`                  |
+| manifest list     | Avro    | `ManifestFile`、`FieldSummary` | `read_manifest_list`   | `write_manifest_list`                      |
+| manifest          | Avro    | `ManifestEntry`、`DataFile`    | `read_manifest`        | `write_manifest`                           |
+| data file         | Parquet | `RecordBatch`                  | `read_task`            | `write_file`                               |
 
-ポインタ以外のファイルは、一度書いたら変更しません。変更するのはポインタだけなので、ポインタの差し替えがテーブル全体の原子的な更新になります。この文書で追う処理の大半は、不変のファイルを下の階層から順に書き、最後にポインタを差し替えるという手順の実装です。
+ポインタ以外のファイルは、一度書いたら変更しません。
+
+変更するのはポインタだけなので、ポインタの差し替えがテーブル全体の原子的な更新になります。
+
+この文書で追う処理の大半は、不変のファイルを下の階層から順に書き、最後にポインタを差し替えるという手順の実装です。
 
 実装は3つのクレートに分かれています。ほかに、テスト専用の `crates/integration_tests` があります。
 
-| クレート | 役割 |
-|---|---|
-| `crates/cli` | SQL を1文実行するコマンド |
-| `crates/datafusion` | core の API を DataFusion の trait に対応づける層 |
-| `crates/core` | テーブルフォーマットの実装。Iceberg の仕様に関わる処理はここにある |
+| クレート            | 役割                                                               |
+| ------------------- | ------------------------------------------------------------------ |
+| `crates/cli`        | SQL を1文実行するコマンド                                          |
+| `crates/datafusion` | core の API を DataFusion の trait に対応づける層                  |
+| `crates/core`       | テーブルフォーマットの実装。Iceberg の仕様に関わる処理はここにある |
 
 ## 2. 起動と SQL の振り分け
 
@@ -114,9 +128,15 @@ async fn run(sql: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-このプロセスはテーブルの状態を持ちません。実行のたびにオブジェクトストレージのポインタから読み直すので、別のプロセスのコミットも次の実行で見えます。
+このプロセスはテーブルの状態を持ちません。
 
-`Catalog` は `ObjectStore` とバケット名を持つだけの構造体です。`Catalog::s3` が `object_store` の S3 クライアントを作ります。core の入出力は `ObjectStore` trait を通るので、テストでは `Catalog::new` にメモリ上の実装を渡して、S3 なしで実行できます。
+実行のたびにオブジェクトストレージのポインタから読み直すので、別のプロセスのコミットも次の実行で見えます。
+
+`Catalog` は `ObjectStore` とバケット名を持つだけの構造体です。
+
+`Catalog::s3` が `object_store` の S3 クライアントを作ります。
+
+core の入出力は `ObjectStore` trait を通るので、テストでは `Catalog::new` にメモリ上の実装を渡して、S3 なしで実行できます。
 
 `session` は DataFusion のセッションを組み立てます。
 
@@ -173,7 +193,9 @@ pub async fn session(catalog: Arc<Catalog>) -> Result<IcebergSession> {
     }
 ```
 
-先に読んでおくのは、DataFusion の `schema_names` と `table_exist` が同期関数で、その中でストレージを読めないからです。一方、テーブルの実体を返す `SchemaProvider::table` は非同期関数なので、呼ばれるたびに最新の metadata を読みます（[4章](#4-insert-data-file-を書く)）。
+先に読んでおくのは、DataFusion の `schema_names` と `table_exist` が同期関数で、その中でストレージを読めないからです。
+
+一方、テーブルの実体を返す `SchemaProvider::table` は非同期関数なので、呼ばれるたびに最新の metadata を読みます（[4章](#4-insert-data-file-を書く)）。
 
 最後に `IcebergSession::sql` が SQL を論理プランにして振り分けます。
 
@@ -191,14 +213,20 @@ pub async fn session(catalog: Arc<Catalog>) -> Result<IcebergSession> {
     }
 ```
 
-`DROP TABLE` を自前で処理する理由は[13章](#13-drop-table)で説明します。`CREATE SCHEMA` は、namespace が暗黙に存在するので何もしません。残りは `execute_logical_plan` に渡りますが、実行のタイミングは文の種類で異なります。
+`DROP TABLE` を自前で処理する理由は[13章](#13-drop-table)で説明します。
+
+`CREATE SCHEMA` は、namespace が暗黙に存在するので何もしません。
+
+残りは `execute_logical_plan` に渡りますが、実行のタイミングは文の種類で異なります。
 
 - `CREATE EXTERNAL TABLE` は DDL なので、`execute_logical_plan` の中で実行されます。
 - `INSERT` と `SELECT` は `DataFrame` を返すだけで、`run` の `.show()` で物理プランが作られて実行されます。
 
 ## 3. CREATE TABLE
 
-`CREATE EXTERNAL TABLE` の処理は、metadata ファイルを1つ書き、それを指すポインタを作るだけです。data file も manifest もまだありません。
+`CREATE EXTERNAL TABLE` の処理は、metadata ファイルを1つ書き、それを指すポインタを作るだけです。
+
+data file も manifest もまだありません。
 
 ```text
 SessionContext::create_external_table     DataFusion
@@ -248,15 +276,25 @@ SessionContext::create_external_table     DataFusion
             })
 ```
 
-field id は列の同一性を表す番号です。Iceberg は列を名前ではなく field id で識別します。統計もパーティション定義もこの番号で列を参照するので、列名を変えても既存のファイルを書き換えずに済みます。`tour.events` の列は次のようになります。
+field id は列の同一性を表す番号です。
 
-| field id | 名前 | 型 | required |
-|---|---|---|---|
-| 1 | `id` | `long` | true |
-| 2 | `ts` | `timestamp` | false |
-| 3 | `name` | `string` | false |
+Iceberg は列を名前ではなく field id で識別します。
 
-`PartitionSpec::parse` は `day(ts)` のような文字列を解析します。この構文はこの実装独自のものです。パーティション定義は「どの列にどの transform を適用するか」のリストで、transform は列の値からパーティション値を計算する関数です。
+統計もパーティション定義もこの番号で列を参照するので、列名を変えても既存のファイルを書き換えずに済みます。
+
+`tour.events` の列は次のようになります。
+
+| field id | 名前   | 型          | required |
+| -------- | ------ | ----------- | -------- |
+| 1        | `id`   | `long`      | true     |
+| 2        | `ts`   | `timestamp` | false    |
+| 3        | `name` | `string`    | false    |
+
+`PartitionSpec::parse` は `day(ts)` のような文字列を解析します。
+
+この構文はこの実装独自のものです。
+
+パーティション定義は「どの列にどの transform を適用するか」のリストで、transform は列の値からパーティション値を計算する関数です。
 
 `crates/core/src/partition.rs`
 
@@ -287,13 +325,17 @@ field id は列の同一性を表す番号です。Iceberg は列を名前では
         }
 ```
 
-`day(ts)` からは、次の `PartitionField` が1つできます。`source_id` は列を field id で参照するので、列名を変えてもパーティション定義は影響を受けません。
+`day(ts)` からは、次の `PartitionField` が1つできます。
+
+`source_id` は列を field id で参照するので、列名を変えてもパーティション定義は影響を受けません。
 
 ```json
 { "source-id": 2, "field-id": 1000, "name": "ts_day", "transform": "day" }
 ```
 
-`Transform::result_type` は、transform をその型に適用できるかの検査と、結果の型の計算を兼ねています。`day` の結果は `date` 型です。この型はのちに manifest の読み書きで使います。
+`Transform::result_type` は、transform をその型に適用できるかの検査と、結果の型の計算を兼ねています。
+
+`day` の結果は `date` 型です。この型はのちに manifest の読み書きで使います。
 
 ### metadata ファイルとポインタを書く
 
@@ -326,11 +368,19 @@ field id は列の同一性を表す番号です。Iceberg は列を名前では
         }
 ```
 
-SQL の `LOCATION ''` は `None` になるので、location は `s3://warehouse/tour/events` になります。`self.path` は `s3://...` をバケット内のキーに変換する関数で、ここではバケットの外を指す location を拒否するために呼んでいます。
+SQL の `LOCATION ''` は `None` になるので、location は `s3://warehouse/tour/events` になります。
 
-順序は「metadata ファイルを書く、ポインタを作る」です。ポインタが見えた時点で指す先が必ず存在するように、この順に書きます。
+`self.path` は `s3://...` をバケット内のキーに変換する関数で、ここではバケットの外を指す location を拒否するために呼んでいます。
 
-`PutMode::Create` は `If-None-Match: *` 付きの PUT で、キーが既に存在すれば失敗します。同名のテーブルを同時に作ると、ポインタを作れるのは1つの書き手だけです。負けた書き手の metadata ファイルは、どこからも参照されないまま残ります。
+順序は「metadata ファイルを書く、ポインタを作る」です。
+
+ポインタが見えた時点で指す先が必ず存在するように、この順に書きます。
+
+`PutMode::Create` は `If-None-Match: *` 付きの PUT で、キーが既に存在すれば失敗します。
+
+同名のテーブルを同時に作ると、ポインタを作れるのは1つの書き手だけです。
+
+負けた書き手の metadata ファイルは、どこからも参照されないまま残ります。
 
 `write_metadata` のファイル名は仕様の命名規則に従います。
 
@@ -350,7 +400,9 @@ SQL の `LOCATION ''` は `None` になるので、location は `s3://warehouse/
     }
 ```
 
-バージョン番号には `metadata_log` の長さを使います。この時点では履歴が空なので `00000` です。
+バージョン番号には `metadata_log` の長さを使います。
+
+この時点では履歴が空なので `00000` です。
 
 書かれた `00000-<uuid>.metadata.json` の内容は次のとおりです（`schemas` と `partition-specs` は上で示した内容なので省略します）。
 
@@ -375,17 +427,31 @@ SQL の `LOCATION ''` は `None` になるので、location は `s3://warehouse/
 }
 ```
 
-`current-snapshot-id` がないのは、snapshot がまだ1つもないからです。`table-uuid` は作成時に割り当てられ、以後変わりません。[7章](#7-コミットの競合と再試行)で、同名の別テーブルとの区別に使います。
+`current-snapshot-id` がないのは、snapshot がまだ1つもないからです。
 
-`TableMetadata` には `#[serde(flatten)] pub extra` というフィールドがあります。この実装が知らないフィールドを JSON のまま保持して、次のコミットでも書き戻すためです。捨てると、他の実装が保存した情報がコミットのたびに消えてしまいます。`Field` と `Snapshot` の `extra` も同じ理由で持っています。他の型には `extra` がないので、未知のキーは保持しません。
+`table-uuid` は作成時に割り当てられ、以後変わりません。
+
+[7章](#7-コミットの競合と再試行)で、同名の別テーブルとの区別に使います。
+
+`TableMetadata` には `#[serde(flatten)] pub extra` というフィールドがあります。
+
+この実装が知らないフィールドを JSON のまま保持して、次のコミットでも書き戻すためです。
+
+捨てると、他の実装が保存した情報がコミットのたびに消えてしまいます。`Field` と `Snapshot` の `extra` も同じ理由で持っています。他の型には `extra` がないので、未知のキーは保持しません。
 
 ポインタの内容は1行です。この形式はこの実装の独自のもので、仕様にはありません。
 
 ```json
-{"metadata-location":"s3://warehouse/tour/events/metadata/00000-3cd04b2d-a204-4192-af96-6cc6cae1571b.metadata.json"}
+{
+  "metadata-location": "s3://warehouse/tour/events/metadata/00000-3cd04b2d-a204-4192-af96-6cc6cae1571b.metadata.json"
+}
 ```
 
-仕様の「Metastore Tables」は、コミットに必要な原子的な差し替えを、check-and-put で更新するポインタで実現できると述べています。check-and-put は「値が読んだときのままなら書き換える」操作です。通常は Hive Metastore などが受け持つこの処理を、ここでは S3 の条件付き PUT で代用しています。
+仕様の「Metastore Tables」は、コミットに必要な原子的な差し替えを、check-and-put で更新するポインタで実現できると述べています。
+
+check-and-put は「値が読んだときのままなら書き換える」操作です。
+
+通常は Hive Metastore などが受け持つこの処理を、ここでは S3 の条件付き PUT で代用しています。
 
 ### テーブルを読み直す
 
@@ -415,15 +481,25 @@ SQL の `LOCATION ''` は `None` になるので、location は `s3://warehouse/
     }
 ```
 
-`Table` に保存した ETag は、コミットの条件になります（[6章](#6-insert-コミットする)）。`Table` は「ある時点の metadata と、それを読んだときのポインタの ETag」を持つハンドルです。指している metadata は不変ですが、他の書き手のコミットで最新ではなくなることがあります。
+`Table` に保存した ETag は、コミットの条件になります（[6章](#6-insert-コミットする)）。
 
-`TableMetadata::parse` は JSON を解析して `validate` を呼びます。`validate` が参照先の存在を確認するので、`current_schema` などのアクセサは `expect` で値を取り出せます。
+`Table` は「ある時点の metadata と、それを読んだときのポインタの ETag」を持つハンドルです。
 
-テーブルを作ったあと、DataFusion が `SchemaProvider::register_table` を呼びます。テーブルは既に Catalog にあるので、ここではローカルのテーブル名の一覧に名前を足すだけです。
+指している metadata は不変ですが、他の書き手のコミットで最新ではなくなることがあります。
+
+`TableMetadata::parse` は JSON を解析して `validate` を呼びます。
+
+`validate` が参照先の存在を確認するので、`current_schema` などのアクセサは `expect` で値を取り出せます。
+
+テーブルを作ったあと、DataFusion が `SchemaProvider::register_table` を呼びます。
+
+テーブルは既に Catalog にあるので、ここではローカルのテーブル名の一覧に名前を足すだけです。
 
 ## 4. INSERT: data file を書く
 
-ここから6章までで、2回目の `INSERT` を追います。1回の INSERT から2個の data file ができるので、パーティション分けの処理を確認できるからです。
+ここから6章までで、2回目の `INSERT` を追います。
+
+1回の INSERT から2個の data file ができるので、パーティション分けの処理を確認できるからです。
 
 ```sql
 INSERT INTO tour.events VALUES
@@ -481,7 +557,11 @@ DataFusion はプランの作成中に、テーブル名を `SchemaProvider::tab
     }
 ```
 
-`events` には `$` も `@` も含まれないので、最後の2行に進みます。`self.load` は `Catalog::load_table` を呼ぶので、ポインタと metadata はここで読まれます。`$` と `@` の分岐は[11章](#11-タイムトラベルとメタデータテーブル)で扱います。
+`events` には `$` も `@` も含まれないので、最後の2行に進みます。
+
+`self.load` は `Catalog::load_table` を呼ぶので、ポインタと metadata はここで読まれます。
+
+`$` と `@` の分岐は[11章](#11-タイムトラベルとメタデータテーブル)で扱います。
 
 次に物理プランの作成で `IcebergTable::insert_into` が呼ばれます。
 
@@ -553,7 +633,9 @@ physical_plan | DataSinkExec: sink=IcebergSink: table=tour.events
     }
 ```
 
-処理は `for` の前後で性質が分かれます。`for` の前で書く data file と manifest は一度だけ書き、競合しても再利用します。`for` の中の処理は、競合のたびに最新の状態の上でやり直します。なぜこの分割が成り立つのかは[7章](#7-コミットの競合と再試行)で説明します。
+処理は `for` の前後で性質が分かれます。`for` の前で書く data file と manifest は一度だけ書き、競合しても再利用します。
+
+`for` の中の処理は、競合のたびに最新の状態の上でやり直します。なぜこの分割が成り立つのかは[7章](#7-コミットの競合と再試行)で説明します。
 
 ### 列をテーブルのスキーマに合わせる
 
@@ -622,11 +704,19 @@ pub fn arrow_field(f: &Field) -> ArrowField {
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
 ```
 
-列は名前で対応づけます。入力のバッチの field id は使えないからです。`VALUES` の出力には field id がなく、`INSERT ... SELECT` の出力には元のテーブルの field id が付いています。`conform` はテーブルのスキーマでバッチを作り直すので、ファイルにはこのテーブルの field id が記録されます。`safe: false` は、変換できない値をエラーにする設定です。既定の `safe: true` は null に置き換えるので、値が気付かれないまま失われます。
+列は名前で対応づけます。入力のバッチの field id は使えないからです。
+
+`VALUES` の出力には field id がなく、`INSERT ... SELECT` の出力には元のテーブルの field id が付いています。
+
+`conform` はテーブルのスキーマでバッチを作り直すので、ファイルにはこのテーブルの field id が記録されます。
+
+`safe: false` は、変換できない値をエラーにする設定です。既定の `safe: true` は null に置き換えるので、値が気付かれないまま失われます。
 
 ### 行をパーティションに分ける
 
-Iceberg では、1つの data file の行はすべて同じパーティション値を持ちます（仕様の「Partitioning」）。読み手がファイル単位でパーティションを判定できるのはこの制約のおかげです。`group_by_partition` は、この制約を満たすように行を分けます。
+Iceberg では、1つの data file の行はすべて同じパーティション値を持ちます（仕様の「Partitioning」）。
+
+読み手がファイル単位でパーティションを判定できるのはこの制約のおかげです。`group_by_partition` は、この制約を満たすように行を分けます。
 
 `crates/core/src/writer.rs`
 
@@ -661,7 +751,11 @@ Iceberg では、1つの data file の行はすべて同じパーティション
     Ok(groups)
 ```
 
-`Datum` は単一の値を表す enum です。同じ値が Arrow の配列、manifest の Avro、統計のバイト列という3つの形で現れるので、`Datum` がそれらの間の共通の表現になります。timestamp はマイクロ秒、date は 1970-01-01 からの日数で持ちます。
+`Datum` は単一の値を表す enum です。
+
+同じ値が Arrow の配列、manifest の Avro、統計のバイト列という3つの形で現れるので、`Datum` がそれらの間の共通の表現になります。
+
+timestamp はマイクロ秒、date は 1970-01-01 からの日数で持ちます。
 
 行 3 の `ts` は `Datum::Timestamp(1704189600000000)` です。`p.transform.apply` は `Transform::Day` の分岐に進みます。
 
@@ -677,16 +771,22 @@ fn days_of(v: &Datum) -> i32 {
 }
 ```
 
-`1704189600000000 / 86400000000` を切り捨てると `19724` で、これが 2024-01-02 を表す `Datum::Date(19724)` です。`/` ではなく `div_euclid` を使うのは、1970 年より前の負の値でも小さい側へ切り捨てるためです。
+`1704189600000000 / 86400000000` を切り捨てると `19724` で、これが 2024-01-02 を表す `Datum::Date(19724)` です。
 
-グループのキーは、値の有無の目印、長さ、値のバイト列をつなげたものです。2つの行は次のキーになります。
+`/` ではなく `div_euclid` を使うのは、1970 年より前の負の値でも小さい側へ切り捨てるためです。
 
-| 行 | パーティション値 | キー（16進） |
-|---|---|---|
-| 3 | `Date(19724)` | `01 0000000000000004 0c4d0000` |
-| 4 | `Date(19725)` | `01 0000000000000004 0d4d0000` |
+グループのキーは、値の有無の目印、長さ、値のバイト列をつなげたものです。
 
-目印と長さを付けないと、異なるタプルが同じキーになることがあります。たとえば文字列の2要素のタプルでは、`("ab", "c")` と `("a", "bc")` が同じバイト列になります。
+2つの行は次のキーになります。
+
+| 行  | パーティション値 | キー（16進）                   |
+| --- | ---------------- | ------------------------------ |
+| 3   | `Date(19724)`    | `01 0000000000000004 0c4d0000` |
+| 4   | `Date(19725)`    | `01 0000000000000004 0d4d0000` |
+
+目印と長さを付けないと、異なるタプルが同じキーになることがあります。
+
+たとえば文字列の2要素のタプルでは、`("ab", "c")` と `("a", "bc")` が同じバイト列になります。
 
 `groups` は2要素になり、`write_data_files` は `take_record_batch` で行を取り出して、グループごとに `write_file` を並行に実行します。
 
@@ -712,7 +812,11 @@ fn days_of(v: &Datum) -> i32 {
         })
 ```
 
-transform の結果はすべての実装で一致する必要があります。`bucket` の値が他の実装とずれると、同じ値の行が別の bucket にあるものとして扱われ、pruning が正しいファイルを除外してしまいます。そのため `hash` は、仕様の「Appendix B」が指定する Murmur3 の x86 32 ビット版を手で実装しています。`crates/integration_tests/tests/transform.rs` の `appendix_b_hashes` が、仕様に載っている値との一致を確認します。
+transform の結果はすべての実装で一致する必要があります。`bucket` の値が他の実装とずれると、同じ値の行が別の bucket にあるものとして扱われ、pruning が正しいファイルを除外してしまいます。
+
+そのため `hash` は、仕様の「Appendix B」が指定する Murmur3 の x86 32 ビット版を手で実装しています。
+
+`crates/integration_tests/tests/transform.rs` の `appendix_b_hashes` が、仕様に載っている値との一致を確認します。
 
 ### Parquet を書く
 
@@ -739,9 +843,17 @@ transform の結果はすべての実装で一致する必要があります。`
     table.catalog().write(&path, buffer).await?;
 ```
 
-`partition_dir` は `ts_day=2024-01-02/` のようなディレクトリ名を作ります。Hive のパーティションと見た目は同じですが、役割が異なります。Hive はパスを解析して値を得るのに対し、Iceberg の読み手は manifest の値を使い、パスを解析しません。ディレクトリ名は人が読むためだけにあるので、`partition_dir` は安全でない文字をエスケープせず `_` に置き換えます。
+`partition_dir` は `ts_day=2024-01-02/` のようなディレクトリ名を作ります。
 
-この時点の data file はどこからも参照されていません。読み手はポインタから順にたどってファイルを見つけるので、コミットするまで読み手に見えません。
+Hive のパーティションと見た目は同じですが、役割が異なります。
+
+Hive はパスを解析して値を得るのに対し、Iceberg の読み手は manifest の値を使い、パスを解析しません。
+
+ディレクトリ名は人が読むためだけにあるので、`partition_dir` は安全でない文字をエスケープせず `_` に置き換えます。
+
+この時点の data file はどこからも参照されていません。
+
+読み手はポインタから順にたどってファイルを見つけるので、コミットするまで読み手に見えません。
 
 `write_file` の後半は、Parquet の情報を `DataFile` に記録します。
 
@@ -768,7 +880,9 @@ transform の結果はすべての実装で一致する必要があります。`
     Ok(file)
 ```
 
-`collect_metrics` は列ごとの件数と上下限を計算します。読み手はこの統計を使い、data file を開かずに読む対象を絞ります（[9章](#9-select-読むファイルを3段階で絞る)）。
+`collect_metrics` は列ごとの件数と上下限を計算します。
+
+読み手はこの統計を使い、data file を開かずに読む対象を絞ります（[9章](#9-select-読むファイルを3段階で絞る)）。
 
 `crates/core/src/writer.rs`
 
@@ -798,19 +912,27 @@ transform の結果はすべての実装で一致する必要があります。`
     }
 ```
 
-統計のキーは field id です。上下限は `Datum::to_bytes` で仕様の「Appendix D」のバイト列にします。int と long はリトルエンディアン、文字列は UTF-8 のバイト列です。上下限に null と NaN を含めないので、その有無は別の件数で持ちます。
+統計のキーは field id です。
+
+上下限は `Datum::to_bytes` で仕様の「Appendix D」のバイト列にします。
+
+int と long はリトルエンディアン、文字列は UTF-8 のバイト列です。
+
+上下限に null と NaN を含めないので、その有無は別の件数で持ちます。
 
 行 3 の data file の `DataFile` は次の値になります。1行だけのファイルなので下限と上限は同じです。
 
-| field id | 列 | `lower_bounds` / `upper_bounds` | 値 |
-|---|---|---|---|
-| 1 | `id` | `0300000000000000` | 3 |
-| 2 | `ts` | `00e8bc8ff30d0600` | 1704189600000000（2024-01-02 10:00:00） |
-| 3 | `name` | `63` | `c` |
+| field id | 列     | `lower_bounds` / `upper_bounds` | 値                                      |
+| -------- | ------ | ------------------------------- | --------------------------------------- |
+| 1        | `id`   | `0300000000000000`              | 3                                       |
+| 2        | `ts`   | `00e8bc8ff30d0600`              | 1704189600000000（2024-01-02 10:00:00） |
+| 3        | `name` | `63`                            | `c`                                     |
 
 ## 5. INSERT: manifest を書く
 
-manifest は data file の一覧を持つ Avro ファイルです。data file を書き終えたので、`Table::append` は `write_added_manifest` で manifest を書きます。
+manifest は data file の一覧を持つ Avro ファイルです。
+
+data file を書き終えたので、`Table::append` は `write_added_manifest` で manifest を書きます。
 
 `crates/core/src/table.rs`
 
@@ -838,11 +960,23 @@ manifest は data file の一覧を持つ Avro ファイルです。data file �
         self.catalog.write(&path, bytes).await?;
 ```
 
-1つの data file が manifest の1行（entry）になります。`status` はこの entry の状態で、`STATUS_ADDED` は「この manifest を書いた snapshot が追加したファイル」を表します。`snapshot_id` は `append` の冒頭で決めた値を書きますが、`sequence_number` は `None` のままにします。sequence number はコミットの順序を表す番号で、コミットが成功するまで確定しないからです。この `None` の扱いが[7章](#7-コミットの競合と再試行)の再試行の前提になります。
+1つの data file が manifest の1行（entry）になります。
+
+`status` はこの entry の状態で、`STATUS_ADDED` は「この manifest を書いた snapshot が追加したファイル」を表します。
+
+`snapshot_id` は `append` の冒頭で決めた値を書きますが、`sequence_number` は `None` のままにします。
+
+sequence number はコミットの順序を表す番号で、コミットが成功するまで確定しないからです。
+
+この `None` の扱いが[7章](#7-コミットの競合と再試行)の再試行の前提になります。
 
 ### Avro への変換
 
-Avro はスキーマ付きのバイナリ形式です。Iceberg の manifest のスキーマは、フィールド名と field id が仕様で決まっています。`manifest_schema` は、この実装で書くスキーマを JSON で組み立てます。
+Avro はスキーマ付きのバイナリ形式です。
+
+Iceberg の manifest のスキーマは、フィールド名と field id が仕様で決まっています。
+
+`manifest_schema` は、この実装で書くスキーマを JSON で組み立てます。
 
 `crates/core/src/manifest.rs`
 
@@ -876,9 +1010,15 @@ Avro はスキーマ付きのバイナリ形式です。Iceberg の manifest の
     ];
 ```
 
-`partition` レコードの形だけはパーティション定義で変わるので、manifest のスキーマは固定にできません。`tour.events` では、`ts_day` という `date` 型のフィールドが1つあるレコードになります。ここで使う型が `Transform::result_type` の結果です。
+`partition` レコードの形だけはパーティション定義で変わるので、manifest のスキーマは固定にできません。
 
-`value_counts` などの統計は、キーが field id の map です。Avro の map はキーが文字列に限られるので、`int_map` は key と value のレコードの配列として表現します。
+`tour.events` では、`ts_day` という `date` 型のフィールドが1つあるレコードになります。
+
+ここで使う型が `Transform::result_type` の結果です。
+
+`value_counts` などの統計は、キーが field id の map です。
+
+Avro の map はキーが文字列に限られるので、`int_map` は key と value のレコードの配列として表現します。
 
 `write_manifest` はスキーマを作り、entry を書きます。
 
@@ -903,9 +1043,13 @@ Avro はスキーマ付きのバイナリ形式です。Iceberg の manifest の
     Ok(w.into_inner()?)
 ```
 
-スキーマとパーティション定義を Avro のファイルメタデータにも書くのは、仕様の「Manifests」の要求です。この実装の読み手はこれらを使わず、metadata ファイルの定義を使います。
+スキーマとパーティション定義を Avro のファイルメタデータにも書くのは、仕様の「Manifests」の要求です。
 
-`entry_value` は `ManifestEntry` を Avro の `Value` に変換するだけの関数です。実際に書かれた manifest の1行目を、統計を省略して JSON で示すと次のようになります。
+この実装の読み手はこれらを使わず、metadata ファイルの定義を使います。
+
+`entry_value` は `ManifestEntry` を Avro の `Value` に変換するだけの関数です。
+
+実際に書かれた manifest の1行目を、統計を省略して JSON で示すと次のようになります。
 
 ```json
 {
@@ -956,7 +1100,9 @@ Avro はスキーマ付きのバイナリ形式です。Iceberg の manifest の
 
 `sequence_number: 0` は仮の値で、`apply_append` が上書きします。
 
-`partitions` は、読み手が manifest を開かずに読む対象を絞るときに使います。`partition_summaries` は、manifest 内の全ファイルについて、パーティションタプルの要素ごとに上下限と null の有無をまとめます。
+`partitions` は、読み手が manifest を開かずに読む対象を絞るときに使います。
+
+`partition_summaries` は、manifest 内の全ファイルについて、パーティションタプルの要素ごとに上下限と null の有無をまとめます。
 
 `crates/core/src/table.rs`
 
@@ -1022,16 +1168,20 @@ Avro はスキーマ付きのバイナリ形式です。Iceberg の manifest の
         }
 ```
 
-2回目の INSERT では、`last_sequence_number` が 1 なので sequence number は 2 です。`self.manifests(parent)` は親の snapshot の manifest list を読むので、`manifests` は次の2行になります。
+2回目の INSERT では、`last_sequence_number` が 1 なので sequence number は 2 です。
 
-| 順 | 由来 | sequence number | `partitions` の範囲 |
-|---|---|---|---|
-| 1 | この INSERT の manifest | 2 | 01-02〜01-03 |
-| 2 | 親から引き継いだ manifest | 1 | 01-01 |
+`self.manifests(parent)` は親の snapshot の manifest list を読むので、`manifests` は次の2行になります。
+
+| 順  | 由来                      | sequence number | `partitions` の範囲 |
+| --- | ------------------------- | --------------- | ------------------- |
+| 1   | この INSERT の manifest   | 2               | 01-02〜01-03        |
+| 2   | 親から引き継いだ manifest | 1               | 01-01               |
 
 親の manifest は manifest list の行を引き継ぐだけで、manifest のファイルは読みも書き直しもしません。manifest list の大きさは、テーブルの行数ではなく manifest の個数で決まります。
 
-次の v3 の処理は、`next_row_id` が `None` の v2 テーブルでは何もしません（[12章](#12-v3-の-row-lineage)）。その次に manifest list を書きます。
+次の v3 の処理は、`next_row_id` が `None` の v2 テーブルでは何もしません（[12章](#12-v3-の-row-lineage)）。
+
+その次に manifest list を書きます。
 
 `crates/core/src/table.rs`
 
@@ -1091,11 +1241,15 @@ Avro はスキーマ付きのバイナリ形式です。Iceberg の manifest の
     }
 ```
 
-`snapshots` に過去の snapshot を残すので、過去の状態へのタイムトラベルが可能になります。`refs` の `main` は、仕様の「Table Metadata」が `current-snapshot-id` と同じ snapshot を指すことを求めているフィールドです。
+`snapshots` に過去の snapshot を残すので、過去の状態へのタイムトラベルが可能になります。
+
+`refs` の `main` は、仕様の「Table Metadata」が `current-snapshot-id` と同じ snapshot を指すことを求めているフィールドです。
 
 ### ポインタを差し替える
 
-ここまでに書いたファイルには、ポインタからまだ到達できません。`Catalog::commit` が metadata ファイルを書き、ポインタを差し替えます。
+ここまでに書いたファイルには、ポインタからまだ到達できません。
+
+`Catalog::commit` が metadata ファイルを書き、ポインタを差し替えます。
 
 `crates/core/src/catalog.rs`
 
@@ -1129,9 +1283,17 @@ Avro はスキーマ付きのバイナリ形式です。Iceberg の manifest の
     }
 ```
 
-`metadata_log` に親の metadata ファイルを足してから `write_metadata` を呼ぶので、ファイルのバージョン番号は親より1つ進みます。2回目の INSERT では `00002-<uuid>.metadata.json` です。
+`metadata_log` に親の metadata ファイルを足してから `write_metadata` を呼ぶので、ファイルのバージョン番号は親より1つ進みます。
 
-`PutMode::Update` は `If-Match: <ETag>` 付きの PUT になります。`base` の ETag は `latest` がポインタを読んだときの値なので、その後にポインタが変わっていれば PUT は 412 で失敗します。成功した PUT がコミットの瞬間です。この PUT の前にプロセスが落ちても、読み手が見るテーブルの状態は変わりません。
+2回目の INSERT では `00002-<uuid>.metadata.json` です。
+
+`PutMode::Update` は `If-Match: <ETag>` 付きの PUT になります。
+
+`base` の ETag は `latest` がポインタを読んだときの値なので、その後にポインタが変わっていれば PUT は 412 で失敗します。
+
+成功した PUT がコミットの瞬間です。
+
+この PUT の前にプロセスが落ちても、読み手が見るテーブルの状態は変わりません。
 
 コミット後の状態を、metadata から順にたどると次のようになります。最後の INSERT まで実行したあとの metadata ファイルから、snapshot の部分を抜粋します。
 
@@ -1165,17 +1327,23 @@ Avro はスキーマ付きのバイナリ形式です。Iceberg の manifest の
 }
 ```
 
-最新の manifest list は3行を持ちます。古い manifest を書き直していないので、1回目と2回目の manifest のパスは、それぞれの INSERT で書いたときのままです。
+最新の manifest list は3行を持ちます。
 
-| `sequence_number` | manifest のパス | `added_files_count` | `lower_bound` | `upper_bound` |
-|---|---|---|---|---|
-| 3 | `1845ddb2-...-m0.avro` | 1 | `0d4d0000`（01-03） | `0d4d0000`（01-03） |
-| 2 | `51a9e4c1-...-m0.avro` | 2 | `0c4d0000`（01-02） | `0d4d0000`（01-03） |
-| 1 | `acf73087-...-m0.avro` | 1 | `0b4d0000`（01-01） | `0b4d0000`（01-01） |
+古い manifest を書き直していないので、1回目と2回目の manifest のパスは、それぞれの INSERT で書いたときのままです。
+
+| `sequence_number` | manifest のパス        | `added_files_count` | `lower_bound`       | `upper_bound`       |
+| ----------------- | ---------------------- | ------------------- | ------------------- | ------------------- |
+| 3                 | `1845ddb2-...-m0.avro` | 1                   | `0d4d0000`（01-03） | `0d4d0000`（01-03） |
+| 2                 | `51a9e4c1-...-m0.avro` | 2                   | `0c4d0000`（01-02） | `0d4d0000`（01-03） |
+| 1                 | `acf73087-...-m0.avro` | 1                   | `0b4d0000`（01-01） | `0b4d0000`（01-01） |
 
 ## 7. コミットの競合と再試行
 
-Iceberg のコミットは楽観的並行性制御です。書き手はロックを取らず、読んだ状態の上に新しい metadata を作り、ポインタの差し替えで競合を検出します。2つの書き手が同じ状態から同時にコミットすると、次の順に進みます。
+Iceberg のコミットは楽観的並行性制御です。
+
+書き手はロックを取らず、読んだ状態の上に新しい metadata を作り、ポインタの差し替えで競合を検出します。
+
+2つの書き手が同じ状態から同時にコミットすると、次の順に進みます。
 
 ```text
 書き手 A                         ポインタ      書き手 B
@@ -1191,26 +1359,50 @@ PUT If-Match: e1 → 200             e2
                                    e3          PUT If-Match: e2 → 200
 ```
 
-`If-Match` により、同じ親から枝分かれする2つのコミットは成立しません。両方の書き手のファイル名に同じバージョン番号が付きますが、UUID があるので上書きし合うことはありません。B の `00006-bbb` は参照されないまま残ります。
+`If-Match` により、同じ親から枝分かれする2つのコミットは成立しません。
 
-追記は他の追記と論理的に衝突しないので（仕様の「Commit Conflict Resolution and Retry」）、B は最新の状態の上で snapshot を作り直すだけでコミットできます。作り直すのは manifest list と metadata ファイルだけです。
+両方の書き手のファイル名に同じバージョン番号が付きますが、UUID があるので上書きし合うことはありません。
 
-| ファイル | 再試行で | 理由 |
-|---|---|---|
-| data file | 再利用する | 内容が他のコミットに依存しない |
-| manifest | 再利用する | sequence number を `null` にしたので、内容がコミットの順序に依存しない。`snapshot_id` は全試行で同じ値を使う |
-| manifest list | 作り直す | 親の manifest の一覧と `sequence_number` が変わる |
-| metadata ファイル | 作り直す | snapshot の一覧が変わる |
+B の `00006-bbb` は参照されないまま残ります。
 
-もし manifest に番号を書くなら、競合のたびに番号が変わるので manifest も書き直すことになります。`null` にしておけば番号の実体は manifest list の1か所だけになり、読み手が補います（仕様の「Sequence Number Inheritance」）。補う処理は[9章](#manifest-を読む)にあります。
+追記は他の追記と論理的に衝突しないので（仕様の「Commit Conflict Resolution and Retry」）、B は最新の状態の上で snapshot を作り直すだけでコミットできます。
+
+作り直すのは manifest list と metadata ファイルだけです。
+
+| ファイル          | 再試行で   | 理由                                                                                                         |
+| ----------------- | ---------- | ------------------------------------------------------------------------------------------------------------ |
+| data file         | 再利用する | 内容が他のコミットに依存しない                                                                               |
+| manifest          | 再利用する | sequence number を `null` にしたので、内容がコミットの順序に依存しない。`snapshot_id` は全試行で同じ値を使う |
+| manifest list     | 作り直す   | 親の manifest の一覧と `sequence_number` が変わる                                                            |
+| metadata ファイル | 作り直す   | snapshot の一覧が変わる                                                                                      |
+
+もし manifest に番号を書くなら、競合のたびに番号が変わるので manifest も書き直すことになります。
+
+`null` にしておけば番号の実体は manifest list の1か所だけになり、読み手が補います（仕様の「Sequence Number Inheritance」）。
+
+補う処理は[9章](#manifest-を読む)にあります。
 
 ### 再試行の細部
 
 `append` のループには、単純な再試行に加えて2つの確認があります。
 
-1つ目は `base.metadata.snapshot(snapshot_id)` の確認です。`object_store` の HTTP クライアントは、失敗したように見える PUT を内部で再送することがあります。1回目の PUT が実は成功していると、再送は `If-Match` の不一致で 412 を返します。呼び出し側には競合に見えますが、コミットは適用済みです。ここで再試行すると同じデータを二重にコミットするので、最新の metadata に自分の snapshot があれば成功として返します。`snapshot_id` を `for` の外で決めるのは、この判定のためであり、再利用する manifest に値を書いているためでもあります。
+1つ目は `base.metadata.snapshot(snapshot_id)` の確認です。
 
-2つ目は `Table::latest` の `table_uuid` の確認です。読み直す間にテーブルが DROP され、同じ名前で別のテーブルが作られていることがあります。そのテーブルにコミットすると、別のテーブルのデータが混ざります。
+`object_store` の HTTP クライアントは、失敗したように見える PUT を内部で再送することがあります。
+
+1回目の PUT が実は成功していると、再送は `If-Match` の不一致で 412 を返します。
+
+呼び出し側には競合に見えますが、コミットは適用済みです。
+
+ここで再試行すると同じデータを二重にコミットするので、最新の metadata に自分の snapshot があれば成功として返します。
+
+`snapshot_id` を `for` の外で決めるのは、この判定のためであり、再利用する manifest に値を書いているためでもあります。
+
+2つ目は `Table::latest` の `table_uuid` の確認です。
+
+読み直す間にテーブルが DROP され、同じ名前で別のテーブルが作られていることがあります。
+
+そのテーブルにコミットすると、別のテーブルのデータが混ざります。
 
 待ち時間はジッタ付きで増やします。
 
@@ -1225,17 +1417,25 @@ fn backoff(attempt: u32) -> Duration {
 
 `MAX_COMMIT_ATTEMPTS`（32回）を超えると `Error::CommitConflict` を返します。
 
-失敗した試行の manifest list と metadata ファイル、コミットに至らなかった data file と manifest は、ストレージに残ります。ポインタから到達できないので読み手には見えません。この実装はこれらを片付けません。
+失敗した試行の manifest list と metadata ファイル、コミットに至らなかった data file と manifest は、ストレージに残ります。
+
+ポインタから到達できないので読み手には見えません。この実装はこれらを片付けません。
 
 ## 8. SELECT: フィルタを述語に変換する
 
-ここからは読み取りの処理を、次の `SELECT` で追います。4個の data file のうち、1個だけを読みます。
+ここからは読み取りの処理を、次の `SELECT` で追います。
+
+4個の data file のうち、1個だけを読みます。
 
 ```sql
 SELECT * FROM tour.events WHERE ts >= TIMESTAMP '2024-01-03 11:00:00';
 ```
 
-`EXPLAIN` の結果は次のとおりです。`IcebergScanExec` の行の数字が、これから追う処理の結果です。`RoundRobinBatch` の数は実行環境の CPU 数で変わります。
+`EXPLAIN` の結果は次のとおりです。
+
+`IcebergScanExec` の行の数字が、これから追う処理の結果です。
+
+`RoundRobinBatch` の数は実行環境の CPU 数で変わります。
 
 ```text
 logical_plan  | Filter: tour.events.ts >= TimestampMicrosecond(1704279600000000, None)
@@ -1269,11 +1469,17 @@ IcebergScanExec::execute                                                    （1
 
 ### pruning が守る条件
 
-pruning は、行の内容を見ずに読むファイルを減らす処理です。以降のすべての判定は、次の条件だけを守ります。
+pruning は、行の内容を見ずに読むファイルを減らす処理です。
+
+以降のすべての判定は、次の条件だけを守ります。
 
 **条件を満たす行を含みうるファイルを、除外しない。**
 
-逆に、関係のないファイルを残すことは許容します。残ったファイルの行は DataFusion が絞り込むからです。`supports_filters_pushdown` はこのことを DataFusion に伝えています。
+逆に、関係のないファイルを残すことは許容します。
+
+残ったファイルの行は DataFusion が絞り込むからです。
+
+`supports_filters_pushdown` はこのことを DataFusion に伝えています。
 
 `crates/datafusion/src/table.rs`
 
@@ -1286,9 +1492,13 @@ pruning は、行の内容を見ずに読むファイルを減らす処理です
     }
 ```
 
-`Inexact` は「押し下げたフィルタで絞るが、残った行の再評価は必要」という意味です。`EXPLAIN` の `partial_filters` と、上に残る `FilterExec` がその結果です。
+`Inexact` は「押し下げたフィルタで絞るが、残った行の再評価は必要」という意味です。
 
-判定できないときは「含みうる」側に倒す、という方針がこの条件の実装です。`convert` は項を捨て、`project` は `Predicate::True` を返し、`range_may_match` は `true` を返します。
+`EXPLAIN` の `partial_filters` と、上に残る `FilterExec` がその結果です。
+
+判定できないときは「含みうる」側に倒す、という方針がこの条件の実装です。
+
+`convert` は項を捨て、`project` は `Predicate::True` を返し、`range_may_match` は `true` を返します。
 
 ### IcebergTable::scan
 
@@ -1341,7 +1551,15 @@ pub enum Predicate {
 }
 ```
 
-`i32` は列の field id です。`Not` がないのは、pruning の判定が否定できないからです。「`p` を満たす行を含みうる」と判定できても、「`NOT p` を満たす行を含まない」とは言えません。ファイルには `p` を満たす行と満たさない行の両方がありうるからです。そこで否定は変換の時点で内側へ押し込み、`NOT (x = 1)` を `x != 1` にしておきます。
+`i32` は列の field id です。
+
+`Not` がないのは、pruning の判定が否定できないからです。
+
+「`p` を満たす行を含みうる」と判定できても、「`NOT p` を満たす行を含まない」とは言えません。
+
+ファイルには `p` を満たす行と満たさない行の両方がありうるからです。
+
+そこで否定は変換の時点で内側へ押し込み、`NOT (x = 1)` を `x != 1` にしておきます。
 
 変換の入口が `to_predicate` です。
 
@@ -1360,7 +1578,9 @@ pub(crate) fn to_predicate(filters: &[Expr], schema: &Schema) -> Predicate {
 }
 ```
 
-`filters` の要素は暗黙に AND で結ばれているので、変換できない要素は `filter_map` で捨てて構いません。AND の項を捨てると条件が緩むだけで、含みうるファイルを除外しないからです。
+`filters` の要素は暗黙に AND で結ばれているので、変換できない要素は `filter_map` で捨てて構いません
+
+。AND の項を捨てると条件が緩むだけで、含みうるファイルを除外しないからです。
 
 `ts >= ...` は `convert` の比較の分岐に進みます。
 
@@ -1378,7 +1598,13 @@ pub(crate) fn to_predicate(filters: &[Expr], schema: &Schema) -> Predicate {
         }
 ```
 
-左が列、右がリテラルなので1つ目の腕に進みます。`5 < x` のように逆向きなら `flip` で `x > 5` に直します。`literal` は `ScalarValue::TimestampMicrosecond` を `Datum::Timestamp` にします。結果の述語は次のとおりです（Rust の値を簡略化して書きます。以下同様）。
+左が列、右がリテラルなので1つ目の腕に進みます。
+
+`5 < x` のように逆向きなら `flip` で `x > 5` に直します。
+
+`literal` は `ScalarValue::TimestampMicrosecond` を `Datum::Timestamp` にします。
+
+結果の述語は次のとおりです（Rust の値を簡略化して書きます。以下同様）。
 
 ```text
 And([Cmp(2, GtEq, Timestamp(1704279600000000))])
@@ -1409,29 +1635,43 @@ fn connective(
 }
 ```
 
-AND は変換できた側だけを残します。OR は片方でも変換できなければ全体を諦めます。OR の項を捨てると条件が厳しくなり、捨てた項だけを満たす行のファイルを除外してしまうからです。
+AND は変換できた側だけを残します。
 
-呼び出し側は、否定の状態に応じて AND と OR を入れ替えます（ド・モルガンの法則）。`lower(name) = 'a'` のような関数呼び出しは変換できないので、次のようになります。
+OR は片方でも変換できなければ全体を諦めます。
 
-| フィルタ | 変換後の接続 | 結果 |
-|---|---|---|
-| `id = 1 AND lower(name) = 'a'` | AND | `id = 1` だけを残す |
-| `id = 1 OR lower(name) = 'a'` | OR | 全体を捨てる |
-| `NOT (id = 1 OR lower(name) = 'a')` | AND | `id != 1` だけを残す |
+OR の項を捨てると条件が厳しくなり、捨てた項だけを満たす行のファイルを除外してしまうからです。
 
-3行目が、否定を先に押し込む理由です。元の式の見た目は OR ですが、否定を押し込むと AND になるので項を捨てられます。
+呼び出し側は、否定の状態に応じて AND と OR を入れ替えます（ド・モルガンの法則）。
 
-この表は、`convert` が受け取った式をどう扱うかの説明です。SQL の経路では、`scan` に届く前に DataFusion の簡約が否定の押し込みと `5 < x` の正規化を済ませ、AND の項を `filters` の別々の要素に分けます。そのため、SQL の AND の項を捨てるのは多くの場合 `to_predicate` の `filter_map` です。
+`lower(name) = 'a'` のような関数呼び出しは変換できないので、次のようになります。
+
+| フィルタ                            | 変換後の接続 | 結果                 |
+| ----------------------------------- | ------------ | -------------------- |
+| `id = 1 AND lower(name) = 'a'`      | AND          | `id = 1` だけを残す  |
+| `id = 1 OR lower(name) = 'a'`       | OR           | 全体を捨てる         |
+| `NOT (id = 1 OR lower(name) = 'a')` | AND          | `id != 1` だけを残す |
+
+3行目が、否定を先に押し込む理由です。
+
+元の式の見た目は OR ですが、否定を押し込むと AND になるので項を捨てられます。
+
+この表は、`convert` が受け取った式をどう扱うかの説明です。
+
+SQL の経路では、`scan` に届く前に DataFusion の簡約が否定の押し込みと `5 < x` の正規化を済ませ、AND の項を `filters` の別々の要素に分けます。
+
+そのため、SQL の AND の項を捨てるのは多くの場合 `to_predicate` の `filter_map` です。
 
 ## 9. SELECT: 読むファイルを3段階で絞る
 
-`TableScan::plan` は、metadata だけを読んで対象の data file を決めます。各段階では上の階層の要約を使うので、除外できれば下の階層を読まずに済みます。
+`TableScan::plan` は、metadata だけを読んで対象の data file を決めます。
 
-| 段階 | 関数 | 単位 | 判定に使う情報 | 使う述語 |
-|---|---|---|---|---|
-| 1 | `manifest_may_match` | manifest | manifest list の `partitions` | 変換後 |
-| 2 | `partition_matches` | data file | manifest entry の `partition` | 変換後 |
-| 3 | `metrics_may_match` | data file | manifest entry の列統計 | 変換前 |
+各段階では上の階層の要約を使うので、除外できれば下の階層を読まずに済みます。
+
+| 段階 | 関数                 | 単位      | 判定に使う情報                | 使う述語 |
+| ---- | -------------------- | --------- | ----------------------------- | -------- |
+| 1    | `manifest_may_match` | manifest  | manifest list の `partitions` | 変換後   |
+| 2    | `partition_matches`  | data file | manifest entry の `partition` | 変換後   |
+| 3    | `metrics_may_match`  | data file | manifest entry の列統計       | 変換前   |
 
 `plan` の前半で、読む snapshot を決めて manifest list を読みます。
 
@@ -1453,7 +1693,9 @@ AND は変換できた側だけを残します。OR は片方でも変換でき�
         let manifests = self.table.manifests(snapshot).await?;
 ```
 
-`Table::manifests` は `read_manifest_list` を呼びます。読むときはフィールドを名前で探します。そのため、他の実装が余分なフィールドを足したファイルも解析できます。
+`Table::manifests` は `read_manifest_list` を呼びます。
+
+読むときはフィールドを名前で探します。そのため、他の実装が余分なフィールドを足したファイルも解析できます。
 
 ### 段階1: manifest を除外する
 
@@ -1478,9 +1720,15 @@ AND は変換できた側だけを残します。OR は片方でも変換でき�
         }
 ```
 
-manifest list の `partitions` はパーティション値の要約なので、`ts` の条件のままでは比較できません。`project` は列の述語をパーティションの述語に変換します。仕様の「Scan Planning」の inclusive projection です。
+manifest list の `partitions` はパーティション値の要約なので、`ts` の条件のままでは比較できません。
 
-inclusive は、「ある行が元の述語を満たすなら、その行のパーティションタプルは変換後の述語を満たす」という性質を指します。逆は成り立たなくて構いません。これは pruning の条件をパーティションの述語に言い換えたものです。
+`project` は列の述語をパーティションの述語に変換します。
+
+仕様の「Scan Planning」の inclusive projection です。
+
+inclusive は、「ある行が元の述語を満たすなら、その行のパーティションタプルは変換後の述語を満たす」という性質を指します。
+
+逆は成り立たなくて構いません。これは pruning の条件をパーティションの述語に言い換えたものです。
 
 `crates/core/src/expr.rs`
 
@@ -1498,7 +1746,11 @@ inclusive は、「ある行が元の述語を満たすなら、その行のパ�
     };
 ```
 
-`per_field` は、列 `id` を元にするパーティションフィールドを探し、それぞれを変換して AND で結びます。列からパーティションフィールドへの対応がなければ `and` は空のリストを受け取って `True` を返します。`WHERE name = 'e'` のようにパーティションと無関係な条件は、段階1と2では何も除外しません。
+`per_field` は、列 `id` を元にするパーティションフィールドを探し、それぞれを変換して AND で結びます。
+
+列からパーティションフィールドへの対応がなければ `and` は空のリストを受け取って `True` を返します。
+
+`WHERE name = 'e'` のようにパーティションと無関係な条件は、段階1と2では何も除外しません。
 
 `Cmp` の変換の本体が `project_cmp` です。
 
@@ -1532,21 +1784,29 @@ fn project_cmp(pos: usize, t: Transform, op: Op, v: &Datum) -> Predicate {
 }
 ```
 
-題材の `ts >= 2024-01-03 11:00:00` は `GtEq` なので `tightened` は `None` です。`Day` を適用すると `Date(19725)` になり、最後の腕で次の述語になります。`i32` の意味が、field id からパーティションタプル内の位置に変わる点に注意してください。
+題材の `ts >= 2024-01-03 11:00:00` は `GtEq` なので `tightened` は `None` です。
+
+`Day` を適用すると `Date(19725)` になり、最後の腕で次の述語になります。
+
+`i32` の意味が、field id からパーティションタプル内の位置に変わる点に注意してください。
 
 ```text
 Cmp(0, GtEq, Date(19725))    -- ts_day >= 2024-01-03
 ```
 
-行の `ts` が 11:00 以降なら、その日付は必ず 01-03 以降です。逆に `ts_day = 01-03` のパーティションには 10:00 の行もありえますが、残す分には問題ありません。
+行の `ts` が 11:00 以降なら、その日付は必ず 01-03 以降です。
 
-`tightened` は、条件を守ったまま除外を増やす最適化です。`ts < 2024-01-02 00:00:00` を例にすると、次のようになります。
+逆に `ts_day = 01-03` のパーティションには 10:00 の行もありえますが、残す分には問題ありません。
 
-| 手順 | 述語 |
-|---|---|
-| そのまま変換した場合 | `ts_day <= 2024-01-02` |
-| `x <= v - 1` に直す | `ts <= 2024-01-01 23:59:59.999999` |
-| 直してから変換した場合 | `ts_day <= 2024-01-01` |
+`tightened` は、条件を守ったまま除外を増やす最適化です。
+
+`ts < 2024-01-02 00:00:00` を例にすると、次のようになります。
+
+| 手順                   | 述語                               |
+| ---------------------- | ---------------------------------- |
+| そのまま変換した場合   | `ts_day <= 2024-01-02`             |
+| `x <= v - 1` に直す    | `ts <= 2024-01-01 23:59:59.999999` |
+| 直してから変換した場合 | `ts_day <= 2024-01-01`             |
 
 `project` は、`float` と `double` の列の比較と `IN` を `True` にします。
 
@@ -1556,7 +1816,13 @@ Cmp(0, GtEq, Date(19725))    -- ts_day >= 2024-01-03
         Predicate::Cmp(id, _, _) | Predicate::In(id, _) if is_float(*id) => Predicate::True,
 ```
 
-DataFusion の比較では、正の NaN はどの数より大きく、負の NaN はどの数より小さくなります。一方、上下限は NaN を含みません。`x > 100.0` を上限で判定すると、NaN の行を持つファイルを除外するおそれがあるので、float の比較には上下限を使いません。`IS NULL`、`IS NOT NULL` と、全行が null かどうかの判定は NaN の影響を受けないので、pruning に使います。
+DataFusion の比較では、正の NaN はどの数より大きく、負の NaN はどの数より小さくなります。
+
+一方、上下限は NaN を含みません。
+
+`x > 100.0` を上限で判定すると、NaN の行を持つファイルを除外するおそれがあるので、float の比較には上下限を使いません。
+
+`IS NULL`、`IS NOT NULL` と、全行が null かどうかの判定は NaN の影響を受けないので、pruning に使います。
 
 変換した述語を、manifest ごとに `manifest_may_match` で判定します。
 
@@ -1582,7 +1848,9 @@ pub fn manifest_may_match(pred: &Predicate, summaries: &[FieldSummary], types: &
 }
 ```
 
-要約の上下限はバイト列なので、`partition_type` で求めた型を使って `Datum::from_bytes` で値に戻します。統計を型に依存しない `bytes` で持つので、読み手が型を与えて解釈します。
+要約の上下限はバイト列なので、`partition_type` で求めた型を使って `Datum::from_bytes` で値に戻します。
+
+統計を型に依存しない `bytes` で持つので、読み手が型を与えて解釈します。
 
 範囲の判定は `range_may_match` が受け持ちます。
 
@@ -1607,13 +1875,15 @@ fn range_may_match(lower: Option<&Datum>, upper: Option<&Datum>, op: Op, v: &Dat
 
 `GtEq` は上限だけを見ます。3つの manifest の判定は次のとおりです。
 
-| `sequence_number` | 範囲 | `hi.compare(19725)` | 結果 |
-|---|---|---|---|
-| 3 | 19725〜19725 | `Equal` | 残す |
-| 2 | 19724〜19725 | `Equal` | 残す |
-| 1 | 19723〜19723 | `Less` | 除外 |
+| `sequence_number` | 範囲         | `hi.compare(19725)` | 結果 |
+| ----------------- | ------------ | ------------------- | ---- |
+| 3                 | 19725〜19725 | `Equal`             | 残す |
+| 2                 | 19724〜19725 | `Equal`             | 残す |
+| 1                 | 19723〜19723 | `Less`              | 除外 |
 
-1回目の INSERT の manifest はファイルを開かずに除外できました。`manifests=2/3` はこの結果です。
+1回目の INSERT の manifest はファイルを開かずに除外できました。
+
+`manifests=2/3` はこの結果です。
 
 ### manifest を読む
 
@@ -1625,7 +1895,9 @@ fn range_may_match(lower: Option<&Datum>, upper: Option<&Datum>, op: Op, v: &Dat
         let entries = try_join_all(selected.iter().map(|(m, _)| self.table.entries(m))).await?;
 ```
 
-`Table::entries` は、manifest を書いたときのパーティション定義から型を求めて `read_manifest` を呼びます。[5章](#5-insert-manifest-を書く)で `null` にした sequence number は、ここで補います。
+`Table::entries` は、manifest を書いたときのパーティション定義から型を求めて `read_manifest` を呼びます。
+
+[5章](#5-insert-manifest-を書く)で `null` にした sequence number は、ここで補います。
 
 `crates/core/src/manifest.rs`
 
@@ -1646,9 +1918,17 @@ fn range_may_match(lower: Option<&Datum>, upper: Option<&Datum>, op: Op, v: &Dat
         let file_sequence_number = inherit("file_sequence_number", manifest.sequence_number)?;
 ```
 
-`manifest` 引数は manifest list の1行です。entry の値が `null` で状態が `ADDED` なら、manifest list の値を使います。2回目の INSERT の entry の `sequence_number` は、ファイル上は `null` ですが、ここで `Some(2)` になります。
+`manifest` 引数は manifest list の1行です。
 
-`read_partition` は、パーティションレコードのフィールドを名前ではなく位置で型と対応づけます。名前は `avro_name` で変換されている場合があるからです。`ts_day` の値は Avro の `date` として読まれ、`Datum::Date(19724)` になります。
+entry の値が `null` で状態が `ADDED` なら、manifest list の値を使います。
+
+2回目の INSERT の entry の `sequence_number` は、ファイル上は `null` ですが、ここで `Some(2)` になります。
+
+`read_partition` は、パーティションレコードのフィールドを名前ではなく位置で型と対応づけます。
+
+名前は `avro_name` で変換されている場合があるからです。
+
+`ts_day` の値は Avro の `date` として読まれ、`Datum::Date(19724)` になります。
 
 ### 段階2と段階3: data file を除外する
 
@@ -1674,7 +1954,9 @@ fn range_may_match(lower: Option<&Datum>, upper: Option<&Datum>, op: Op, v: &Dat
         Ok(plan)
 ```
 
-段階2の `partition_matches` は、変換後の述語をファイルのパーティションタプルで評価します。1つのファイルの行はすべて同じタプルを持つので、範囲ではなく単一の値で判定できます。
+段階2の `partition_matches` は、変換後の述語をファイルのパーティションタプルで評価します。
+
+1つのファイルの行はすべて同じタプルを持つので、範囲ではなく単一の値で判定できます。
 
 `crates/core/src/expr.rs`
 
@@ -1703,7 +1985,13 @@ pub fn partition_matches(pred: &Predicate, partition: &[Option<Datum>]) -> bool 
 }
 ```
 
-段階3の `metrics_may_match` は、列の統計で判定します。ここで使う述語は変換前の `self.filter` です。統計はパーティション値ではなく列の値についての情報だからです。パーティションにしていない列の条件も、この段階なら除外に使えます。
+段階3の `metrics_may_match` は、列の統計で判定します。
+
+ここで使う述語は変換前の `self.filter` です。
+
+統計はパーティション値ではなく列の値についての情報だからです。
+
+パーティションにしていない列の条件も、この段階なら除外に使えます。
 
 `crates/core/src/expr.rs`
 
@@ -1739,17 +2027,21 @@ pub fn metrics_may_match(pred: &Predicate, file: &DataFile, schema: &Schema) -> 
 }
 ```
 
-`all_null` の判定は、null は比較の述語を満たさないという SQL の規則に基づきます。全行が null の列に比較の条件があれば、そのファイルは除外できます。
+`all_null` の判定は、null は比較の述語を満たさないという SQL の規則に基づきます。
+
+全行が null の列に比較の条件があれば、そのファイルは除外できます。
 
 残った2つの manifest には3個のファイルがあります。
 
-| manifest | ファイルの行 | 段階2 `ts_day >= 01-03` | 段階3 `ts >= 11:00` | 結果 |
-|---|---|---|---|---|
-| sequence 3 | id=5（01-03 12:00） | 01-03 で通過 | 上限 12:00 で通過 | 読む |
-| sequence 2 | id=3（01-02 10:00） | 01-02 で除外 | 判定しない | `pruned_by_partition` |
-| sequence 2 | id=4（01-03 10:00） | 01-03 で通過 | 上限 10:00 で除外 | `pruned_by_metrics` |
+| manifest   | ファイルの行        | 段階2 `ts_day >= 01-03` | 段階3 `ts >= 11:00` | 結果                  |
+| ---------- | ------------------- | ----------------------- | ------------------- | --------------------- |
+| sequence 3 | id=5（01-03 12:00） | 01-03 で通過            | 上限 12:00 で通過   | 読む                  |
+| sequence 2 | id=3（01-02 10:00） | 01-02 で除外            | 判定しない          | `pruned_by_partition` |
+| sequence 2 | id=4（01-03 10:00） | 01-03 で通過            | 上限 10:00 で除外   | `pruned_by_metrics`   |
 
-`EXPLAIN` の `manifests=2/3, files=1/3, pruned_by_partition=1, pruned_by_metrics=1` が、この結果です。`files=1/3` の分母は段階1を通過した manifest に含まれるファイルの数で、テーブル全体の4個ではありません。
+`EXPLAIN` の `manifests=2/3, files=1/3, pruned_by_partition=1, pruned_by_metrics=1` が、この結果です。
+
+`files=1/3` の分母は段階1を通過した manifest に含まれるファイルの数で、テーブル全体の4個ではありません。
 
 ## 10. SELECT: Parquet を読む
 
@@ -1765,7 +2057,9 @@ pub fn metrics_may_match(pred: &Predicate, file: &DataFile, schema: &Schema) -> 
         }
 ```
 
-`clamp(1, ...)` の下限は、タスクが0個でも1つの空のパーティションを作るためです。DataFusion はパーティションごとに `execute` を呼びます。
+`clamp(1, ...)` の下限は、タスクが0個でも1つの空のパーティションを作るためです。
+
+DataFusion はパーティションごとに `execute` を呼びます。
 
 `crates/datafusion/src/table.rs`
 
@@ -1810,9 +2104,17 @@ pub fn metrics_may_match(pred: &Predicate, file: &DataFile, schema: &Schema) -> 
         .collect();
 ```
 
-ファイルサイズは manifest に記録されているので、それを `with_file_size` で渡します。`ParquetRecordBatchStreamBuilder::new` が Parquet のフッターを読むと、`builder.schema()` からファイルの列がわかります。
+ファイルサイズは manifest に記録されているので、それを `with_file_size` で渡します。
 
-`file_columns` は field id からファイル内の列位置への対応表です。[4章](#列をテーブルのスキーマに合わせる)の `arrow_field` が書いた field id を、ここで読み戻します。`tour.events` のファイルでは `{1: 0, 2: 1, 3: 2}` になります。列名ではなく field id で探すので、テーブルの列名が変わっていても、ファイル内の古い名前に影響されません。
+`ParquetRecordBatchStreamBuilder::new` が Parquet のフッターを読むと、`builder.schema()` からファイルの列がわかります。
+
+`file_columns` は field id からファイル内の列位置への対応表です。
+
+[4章](#列をテーブルのスキーマに合わせる)の `arrow_field` が書いた field id を、ここで読み戻します。
+
+`tour.events` のファイルでは `{1: 0, 2: 1, 3: 2}` になります。
+
+列名ではなく field id で探すので、テーブルの列名が変わっていても、ファイル内の古い名前に影響されません。
 
 field id を1つも持たないファイルは拒否します。一部の列にだけ field id があるファイルでは、field id のない列をファイルにない列として扱います。
 
@@ -1851,13 +2153,17 @@ field id を1つも持たないファイルは拒否します。一部の列に�
 
 `sources` は出力の各列の取得元です。仮に `projection` が `[name, id]` の順なら、次のようになります。
 
-| 変数 | 値 | 意味 |
-|---|---|---|
-| `roots` | `[0, 2]` | ソート済みの、読むファイルの列位置 |
-| `sources[0]`（`name`） | `Column(1)` | 読んだバッチの2列目 |
-| `sources[1]`（`id`） | `Column(0)` | 読んだバッチの1列目 |
+| 変数                   | 値          | 意味                               |
+| ---------------------- | ----------- | ---------------------------------- |
+| `roots`                | `[0, 2]`    | ソート済みの、読むファイルの列位置 |
+| `sources[0]`（`name`） | `Column(1)` | 読んだバッチの2列目                |
+| `sources[1]`（`id`）   | `Column(0)` | 読んだバッチの1列目                |
 
-ファイルにない列は `Source::Constant` になります。`identity_value` は、その列の値がパーティションタプルにあればそれを使い、なければ null にします。identity パーティションの列はタプルに値そのものがあるので、ファイルに列がなくても復元できます。
+ファイルにない列は `Source::Constant` になります。
+
+`identity_value` は、その列の値がパーティションタプルにあればそれを使い、なければ null にします。
+
+identity パーティションの列はタプルに値そのものがあるので、ファイルに列がなくても復元できます。
 
 ### バッチの形を整える
 
@@ -1884,9 +2190,15 @@ field id を1つも持たないファイルは拒否します。一部の列に�
     )?)
 ```
 
-`with_row_count` を指定するのは、`COUNT(*)` のように読む列が1つもない場合があるからです。列のないバッチは列から行数を求められないので、明示します。
+`with_row_count` を指定するのは、`COUNT(*)` のように読む列が1つもない場合があるからです。
 
-バッチは `IcebergScanExec` から `RepartitionExec` を経て `FilterExec` に届きます。`FilterExec` は `ts >= 11:00` を行ごとに再評価します。題材のファイルは id=5 の1行だけで、この行は条件を満たすので、結果は次のようになります。
+列のないバッチは列から行数を求められないので、明示します。
+
+バッチは `IcebergScanExec` から `RepartitionExec` を経て `FilterExec` に届きます。
+
+`FilterExec` は `ts >= 11:00` を行ごとに再評価します。
+
+題材のファイルは id=5 の1行だけで、この行は条件を満たすので、結果は次のようになります。
 
 ```text
 +----+---------------------+------+
@@ -1896,21 +2208,33 @@ field id を1つも持たないファイルは拒否します。一部の列に�
 +----+---------------------+------+
 ```
 
-ファイルの中に条件を満たさない行が混ざっていれば、ここで落ちます。pruning がファイルを残しすぎても結果が正しいのは、この再評価があるからです。
+ファイルの中に条件を満たさない行が混ざっていれば、ここで落ちます。
+
+pruning がファイルを残しすぎても結果が正しいのは、この再評価があるからです。
 
 ## 11. タイムトラベルとメタデータテーブル
 
-タイムトラベルは、ここまでの読み取りの入口を変えるだけです。メタデータテーブルは pruning と Parquet の読み出しを通らず、metadata と manifest の内容をメモリ上の表で返します。
+タイムトラベルは、ここまでの読み取りの入口を変えるだけです。
+
+メタデータテーブルは pruning と Parquet の読み出しを通らず、metadata と manifest の内容をメモリ上の表で返します。
 
 ### タイムトラベル
 
-`SELECT * FROM tour."events@3859074123582057973"` は、`IcebergSchemaProvider::table` の `@` の分岐に進み、`IcebergTable::at_snapshot` を返します。`snapshot_id` が `Some` なので、`IcebergTable::scan` は `TableScan::snapshot_id` を呼び、`plan` の冒頭で `metadata.snapshot(id)` がその snapshot を選びます。
+`SELECT * FROM tour."events@3859074123582057973"` は、`IcebergSchemaProvider::table` の `@` の分岐に進み、`IcebergTable::at_snapshot` を返します。
 
-snapshot は自分の manifest list を持ち、過去の manifest list も manifest も不変なので、処理の起点を変えるだけで過去のテーブルの内容を読めます。スキーマは現在のものを使いますが、この実装にはスキーマを変える操作がないので、この実装で作ったテーブルでは結果に影響しません。過去の snapshot への `INSERT` は `insert_into` が拒否します。
+`snapshot_id` が `Some` なので、`IcebergTable::scan` は `TableScan::snapshot_id` を呼び、`plan` の冒頭で `metadata.snapshot(id)` がその snapshot を選びます。
+
+snapshot は自分の manifest list を持ち、過去の manifest list も manifest も不変なので、処理の起点を変えるだけで過去のテーブルの内容を読めます。
+
+スキーマは現在のものを使いますが、この実装にはスキーマを変える操作がないので、この実装で作ったテーブルでは結果に影響しません。
+
+過去の snapshot への `INSERT` は `insert_into` が拒否します。
 
 ### メタデータテーブル
 
-`"events$snapshots"`、`"events$manifests"`、`"events$files"` は、`$` の分岐から `metadata_table` に進みます。これらは仕様の一部ではなく、Spark などのエンジンが提供する機能に相当します。
+`"events$snapshots"`、`"events$manifests"`、`"events$files"` は、`$` の分岐から `metadata_table` に進みます。
+
+これらは仕様の一部ではなく、Spark などのエンジンが提供する機能に相当します。
 
 `crates/datafusion/src/inspect.rs`
 
@@ -1931,7 +2255,11 @@ pub(crate) async fn metadata_table(table: &Table, kind: &str) -> Result<Arc<dyn 
 }
 ```
 
-`$snapshots` は metadata の snapshot の一覧を、`$manifests` は `Table::manifests` の結果を、`$files` はさらに `Table::entries` の結果を、メモリ上の表にします。`MetadataTable` で `MemTable` を包むのは、`MemTable` の `insert_into` を隠すためです。そのまま公開すると、INSERT が成功を報告しながら何も保存しません。
+`$snapshots` は metadata の snapshot の一覧を、`$manifests` は `Table::manifests` の結果を、`$files` はさらに `Table::entries` の結果を、メモリ上の表にします。
+
+`MetadataTable` で `MemTable` を包むのは、`MemTable` の `insert_into` を隠すためです。
+
+そのまま公開すると、INSERT が成功を報告しながら何も保存しません。
 
 `$files` を使うと、[9章](#9-select-読むファイルを3段階で絞る)で判定に使った情報を確認できます。
 
@@ -1954,9 +2282,17 @@ mise run sql 'SELECT partition, record_count, lower_bounds, upper_bounds FROM to
 
 ## 12. v3 の row lineage
 
-row lineage は v3 の機能で、テーブルの各行に ID を割り当てます。行の ID は、data file の `first_row_id` にファイル内の位置を足した値です。`first_row_id` は sequence number と同じ理由で、コミット時に確定して読み手が補います。`tour.events` は v2 なので、この章の説明では `OPTIONS ('format-version' '3')` を付けたテーブルを想定します。
+row lineage は v3 の機能で、テーブルの各行に ID を割り当てます。
 
-`TableMetadata` の `next_row_id` が次に使える ID を持ちます。`apply_append` は、manifest list に載せる manifest のうち、範囲が未割り当てのものに ID を割り当てます。
+行の ID は、data file の `first_row_id` にファイル内の位置を足した値です。
+
+`first_row_id` は sequence number と同じ理由で、コミット時に確定して読み手が補います。
+
+`tour.events` は v2 なので、この章の説明では `OPTIONS ('format-version' '3')` を付けたテーブルを想定します。
+
+`TableMetadata` の `next_row_id` が次に使える ID を持ちます。
+
+`apply_append` は、manifest list に載せる manifest のうち、範囲が未割り当てのものに ID を割り当てます。
 
 `crates/core/src/table.rs`
 
@@ -1976,7 +2312,9 @@ row lineage は v3 の機能で、テーブルの各行に ID を割り当てま
         }
 ```
 
-割り当ては manifest 単位です。ファイル単位の値は manifest に書かず、`read_manifest` が求めます。
+割り当ては manifest 単位です。
+
+ファイル単位の値は manifest に書かず、`read_manifest` が求めます。
 
 `crates/core/src/manifest.rs`
 
@@ -1990,17 +2328,27 @@ row lineage は v3 の機能で、テーブルの各行に ID を割り当てま
         }
 ```
 
-`next_row_id` の初期値は manifest の `first_row_id` です。manifest 内の entry を順に読みながら `record_count` を足します。この値はファイルの順序に依存しますが、manifest は不変なので、読むたびに同じ結果になります。
+`next_row_id` の初期値は manifest の `first_row_id` です。
 
-`Table::upgrade_to_v3` は `format_version` を 3 に、`next_row_id` を 0 にしてコミットするだけです。既存の manifest は `first_row_id` を持たないので、次のコミットの `apply_append` が他の manifest と同様に範囲を割り当てます。テスト `upgrading_to_v3_assigns_row_ids_to_existing_files_on_the_next_commit` の流れは次のとおりです。
+manifest 内の entry を順に読みながら `record_count` を足します。
 
-| 操作 | manifest list の順 | 結果 |
-|---|---|---|
-| v2 で3行を追記 | m1 | `first_row_id` なし |
-| `upgrade_to_v3` | m1 | `next_row_id = 0` |
-| 1行を追記 | m2、m1 | m2 に 0、m1 に 1 を割り当てる。`next_row_id = 4`、snapshot の `added_rows = 4` |
+この値はファイルの順序に依存しますが、manifest は不変なので、読むたびに同じ結果になります。
 
-アップグレード後の最初のコミットでは、`manifests` の先頭が新しい manifest なので、新しいファイルの ID のほうが小さくなります。以降のコミットでは古い manifest が割り当て済みなので、新しいファイルの ID のほうが大きくなります。
+`Table::upgrade_to_v3` は `format_version` を 3 に、`next_row_id` を 0 にしてコミットするだけです。
+
+既存の manifest は `first_row_id` を持たないので、次のコミットの `apply_append` が他の manifest と同様に範囲を割り当てます。
+
+テスト `upgrading_to_v3_assigns_row_ids_to_existing_files_on_the_next_commit` の流れは次のとおりです。
+
+| 操作            | manifest list の順 | 結果                                                                           |
+| --------------- | ------------------ | ------------------------------------------------------------------------------ |
+| v2 で3行を追記  | m1                 | `first_row_id` なし                                                            |
+| `upgrade_to_v3` | m1                 | `next_row_id = 0`                                                              |
+| 1行を追記       | m2、m1             | m2 に 0、m1 に 1 を割り当てる。`next_row_id = 4`、snapshot の `added_rows = 4` |
+
+アップグレード後の最初のコミットでは、`manifests` の先頭が新しい manifest なので、新しいファイルの ID のほうが小さくなります。
+
+以降のコミットでは古い manifest が割り当て済みなので、新しいファイルの ID のほうが大きくなります。
 
 この実装が扱うのは ID の割り当てまでで、`_row_id` 列の読み出しは実装していません。割り当てた値はメタデータテーブルの `first_row_id` 列で確認できます。
 
@@ -2024,34 +2372,40 @@ row lineage は v3 の機能で、テーブルの各行に ID を割り当てま
     }
 ```
 
-消すのはポインタだけです。data file と metadata ファイルは残ります。
+消すのはポインタだけです。
 
-DataFusion の通常の経路を使わないのは、`SchemaProvider::deregister_table` が `DROP TABLE` と `CREATE OR REPLACE` の最初の手順の両方から呼ばれるからです。プロバイダからは、確定した削除と、これから失敗するかもしれない置き換えを区別できません。置き換えの途中で失敗すると既存のテーブルが失われるので、プロバイダは登録解除を拒否し、`DROP TABLE` だけを `IcebergSession` で処理します。
+data file と metadata ファイルは残ります。
+
+DataFusion の通常の経路を使わないのは、`SchemaProvider::deregister_table` が `DROP TABLE` と `CREATE OR REPLACE` の最初の手順の両方から呼ばれるからです。
+
+プロバイダからは、確定した削除と、これから失敗するかもしれない置き換えを区別できません。
+
+置き換えの途中で失敗すると既存のテーブルが失われるので、プロバイダは登録解除を拒否し、`DROP TABLE` だけを `IcebergSession` で処理します。
 
 ## 14. 実装していないものとテスト
 
 この実装は追記だけを扱います。次の機能はありません。
 
-| 機能 | この実装の動作 |
-|---|---|
-| delete file（行の削除） | 読む snapshot に delete manifest があれば `TableScan::plan` がエラーにする。メタデータテーブルは検査しない |
-| スキーマ進化 | 変更の操作がない。読み取りは field id で解決する |
-| パーティション進化 | 変更の操作がない。この実装が作るテーブルの `spec_id` は常に 0。読み取りは manifest の `partition_spec_id` で定義を選ぶ |
-| name mapping | field id を1つも持たない Parquet の読み取りはエラーにする |
-| `initial-default` | ファイルにない列は、identity パーティションの値がなければ null にする |
-| 不要なファイルの削除 | 失敗したコミットのファイルも、DROP したテーブルのファイルも残る |
-| `_row_id` の読み出し | ID の割り当てだけを行う |
+| 機能                    | この実装の動作                                                                                                         |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| delete file（行の削除） | 読む snapshot に delete manifest があれば `TableScan::plan` がエラーにする。メタデータテーブルは検査しない             |
+| スキーマ進化            | 変更の操作がない。読み取りは field id で解決する                                                                       |
+| パーティション進化      | 変更の操作がない。この実装が作るテーブルの `spec_id` は常に 0。読み取りは manifest の `partition_spec_id` で定義を選ぶ |
+| name mapping            | field id を1つも持たない Parquet の読み取りはエラーにする                                                              |
+| `initial-default`       | ファイルにない列は、identity パーティションの値がなければ null にする                                                  |
+| 不要なファイルの削除    | 失敗したコミットのファイルも、DROP したテーブルのファイルも残る                                                        |
+| `_row_id` の読み出し    | ID の割り当てだけを行う                                                                                                |
 
 各章の処理の性質は、テストでも確認できます。`rustfs.rs` と `conditional_put.rs` は RustFS が必要です。`regressions.rs` と `manifest.rs` は RustFS なしで実行できます。
 
-| 確かめたい性質 | テスト | ファイル | 章 |
-|---|---|---|---|
-| RustFS が条件付き PUT を守る | `rustfs_enforces_if_none_match_and_if_match` | `conditional_put.rs` | 3、6 |
-| sequence number の継承 | `added_entries_inherit_from_the_manifest_list` | `manifest.rs` | 5、9 |
-| 並行コミットが直線の履歴になる | `concurrent_appends_all_land_in_one_linear_history` | `rustfs.rs` | 7 |
-| 再送された PUT で二重コミットしない | `a_commit_that_applied_despite_a_conflict_is_not_applied_twice` | `regressions.rs` | 7 |
-| 作り直されたテーブルにコミットしない | `a_stale_handle_cannot_commit_to_a_recreated_table` | `regressions.rs` | 7 |
-| 3段階の pruning が行を失わない | `every_pruning_stage_removes_work_without_losing_rows` | `rustfs.rs` | 9 |
-| 列を field id で解決する | `columns_resolve_by_field_id_not_by_name` | `rustfs.rs` | 10 |
-| v3 へのアップグレード後の row id | `upgrading_to_v3_assigns_row_ids_to_existing_files_on_the_next_commit` | `rustfs.rs` | 12 |
-| 他の実装が読めるファイルを書く | `iceberg_rust_reads_a_v2_table_written_here` | `rustfs.rs` | 全体 |
+| 確かめたい性質                       | テスト                                                                 | ファイル             | 章   |
+| ------------------------------------ | ---------------------------------------------------------------------- | -------------------- | ---- |
+| RustFS が条件付き PUT を守る         | `rustfs_enforces_if_none_match_and_if_match`                           | `conditional_put.rs` | 3、6 |
+| sequence number の継承               | `added_entries_inherit_from_the_manifest_list`                         | `manifest.rs`        | 5、9 |
+| 並行コミットが直線の履歴になる       | `concurrent_appends_all_land_in_one_linear_history`                    | `rustfs.rs`          | 7    |
+| 再送された PUT で二重コミットしない  | `a_commit_that_applied_despite_a_conflict_is_not_applied_twice`        | `regressions.rs`     | 7    |
+| 作り直されたテーブルにコミットしない | `a_stale_handle_cannot_commit_to_a_recreated_table`                    | `regressions.rs`     | 7    |
+| 3段階の pruning が行を失わない       | `every_pruning_stage_removes_work_without_losing_rows`                 | `rustfs.rs`          | 9    |
+| 列を field id で解決する             | `columns_resolve_by_field_id_not_by_name`                              | `rustfs.rs`          | 10   |
+| v3 へのアップグレード後の row id     | `upgrading_to_v3_assigns_row_ids_to_existing_files_on_the_next_commit` | `rustfs.rs`          | 12   |
+| 他の実装が読めるファイルを書く       | `iceberg_rust_reads_a_v2_table_written_here`                           | `rustfs.rs`          | 全体 |
